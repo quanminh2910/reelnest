@@ -276,7 +276,7 @@ try {
   await waitFor(`!${launcher} || getComputedStyle(document.querySelector('[data-reel-saver-launcher]')).display === 'none'`, 'reserved routes hide launcher');
   assert.deepEqual(exceptions, [], 'no uncaught browser exceptions');
   console.log('PASS Escape handling, reserved-route cleanup, no uncaught exceptions');
-  console.log('Screenshot: reel-saver/artifacts/profile-panel-preview.png');
+  console.log('Screenshot: artifacts/profile-panel-preview.png');
   await send('Browser.close');
 } finally {
   if (ws?.readyState === WebSocket.OPEN) ws.close();

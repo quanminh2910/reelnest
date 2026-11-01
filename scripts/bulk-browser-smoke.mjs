@@ -548,7 +548,7 @@ try {
   await waitFor(`${query('[data-role=cache-import-cancel]')}.hidden && !${query('[data-role=cache-clear]')}.disabled`,'import Cancel releases clear action');
   console.log('PASS clear action is unavailable during active and paused jobs or report import');
   assert.deepEqual(exceptions,[],'no uncaught browser exceptions');
-  console.log('Screenshot:reel-saver/artifacts/bulk-panel-preview.png');
+  console.log('Screenshot: artifacts/bulk-panel-preview.png');
   await send('Browser.close');
 
 } finally {

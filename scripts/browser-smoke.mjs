@@ -162,7 +162,7 @@ try {
   assert.equal(await evaluate('window.__reelFixture.downloadCalls'), 0);
   assert.deepEqual(exceptions, [], 'popup should not throw browser exceptions');
   console.log('PASS invalid-page feedback; no uncaught page exceptions');
-  console.log('Screenshot: reel-saver/artifacts/popup-preview.png');
+  console.log('Screenshot: artifacts/popup-preview.png');
   await send('Browser.close');
 } finally {
   if (ws?.readyState === WebSocket.OPEN) ws.close();

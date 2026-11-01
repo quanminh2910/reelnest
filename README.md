@@ -6,16 +6,16 @@ A Chrome extension for saving Instagram Reels individually or in profile batches
 
 1. Open `chrome://extensions` in Chrome (or `edge://extensions` in Edge).
 2. Turn on **Developer mode**.
-3. Click **Load unpacked** and select this **reel-saver** folder, containing `manifest.json`.
+3. Click **Load unpacked** and select this **reelnest** folder, containing `manifest.json`.
 4. Pin **ReelNest** using the browser's extensions menu.
 
 There is no build step or dependency installation. Node.js is needed only for development checks.
 
 ### Update an existing installation
 
-On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reel-saver` folder or extract **reelnest-0.4.2.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.4.2.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
 
-Version **0.4.2** renames Reel Saver to **ReelNest**. Update the existing unpacked installation from the same `reel-saver` directory. Existing library folder names, `.reel-saver-*.json` metadata, and older download reports remain compatible. Keep using your current library root; it does not need to be renamed. Browser Downloads continues saving under `Downloads/Reel Saver`.
+Version **0.4.2** renames Reel Saver to **ReelNest**. The project folder is named `reelnest`. If your unpacked extension points to the previous `reel-saver` path, remove that old entry and load the `reelnest` folder, then refresh Instagram. Existing library folder names, `.reel-saver-*.json` metadata, and older download reports remain compatible. Keep using your current library root; it does not need to be renamed. Browser Downloads continues saving under `Downloads/Reel Saver`.
 
 Version **0.4.0** adds profile libraries, verified duplicate skipping, persistent per-profile history, and an explicit report importer for existing videos. Both profile-panel single saves and bulk saves use the same library. Browser Downloads and the toolbar popup keep their existing behavior.
 
@@ -165,7 +165,7 @@ The extension runs content scripts only on `instagram.com` and `www.instagram.co
 Use Node.js 20 or newer. No npm packages are required.
 
 ```powershell
-cd reel-saver
+cd reelnest
 npm run check
 npm test
 # Optional: popup smoke test in an isolated Chromium browser
@@ -186,7 +186,7 @@ npm run test:extension
 Files:
 
 ```text
-reel-saver/
+reelnest/
   manifest.json             Extension entry points and permissions
   package.json              Development commands
   README.md
