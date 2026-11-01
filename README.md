@@ -13,7 +13,9 @@ There is no build step or dependency installation. Node.js is needed only for de
 
 ### Update an existing installation
 
-On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.5.0.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.5.1.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+
+Version **0.5.1** fixes repeated limited runs in **Browser Downloads**: with **Skip videos already downloaded** enabled, a run that saves 25 can be followed by a limit of 10 to save up to 10 additional Reels. Completed earlier ReelNest downloads are recognized from Chrome's download history, including downloads made before this fix. Update by reloading the existing installation at the same unpacked folder path; recognition checks the extension ID that created each download. Removing/reinstalling at a different path can change that ID.
 
 Version **0.5.0** adds an optional maximum number of newly saved videos for a single-profile bulk run. **Unlimited** preserves the previous behavior. A custom limit applies to both Library folder and Browser Downloads, survives pause/resume, and appears in the exported report. Cached videos and failed attempts do not consume it. Profile queues are planned separately.
 
@@ -57,7 +59,13 @@ The root lookup can be rebuilt from the child cache files. Back up or move each 
 
 Repeat imports recognize already recorded files. Canceled, failed, missing, and conflicting entries are not treated as downloaded. A report from a stopped job can seed verified history, but its canceled entries do not establish the remaining profile total. The extension does not move or delete existing videos, and filenames alone are not sufficient proof of a completed save.
 
-Folder history applies to **Library folder** downloads. Browser Downloads does not grant access to read or update its directory, so it does not participate in this on-disk cache.
+Folder history applies to **Library folder** downloads. Browser Downloads does not grant access to read or update its directory, so it does not participate in this on-disk cache. Its bulk downloader instead checks Chrome's records for completed MP4s created by this ReelNest installation. This check does not read file bytes or create cache files in the Downloads folder.
+
+### Browser Downloads history
+
+**Skip videos already downloaded** is also enabled by default for bulk Browser Downloads. A matching completed download is shown as **Already saved**, and discovery continues until the new-save limit is reached or the feed ends. Uncheck it to deliberately save another copy. A prior copy is recognized using its exact Reel filename/shortcode, this extension's ownership, accepted MP4 type, positive file size, trusted media source, and Chrome's existing-file indication. Interrupted downloads and records marked missing remain eligible.
+
+This relies on retained Chrome download history, rather than inspecting arbitrary existing files. Clearing that history or changing the extension's installation ID can make earlier files unrecognizable. Chrome can briefly report stale file-existence information after a file is moved or deleted. Ambiguous legacy filenames are left eligible instead of being guessed. For persistent per-profile history with actual file/header checks, use the Library folder destination.
 
 ### Clear the current profile's cache
 
@@ -100,7 +108,7 @@ Version **0.3.1** retained operation and fragment defaults, filled a declared mi
 
 **Scan all first** discovers the complete list before saving. When the scan finishes, approve the download to begin. A custom limit still applies to saves; it does not shorten this full scan. Batch size controls grouping, not parallel downloads or the total number saved.
 
-The limit counts confirmed successful new saves in this run. For example, batch size **35** with limit **50** saves up to **35**, then **15**; already-saved files, duplicate discovery IDs, unavailable Reels, and failed attempts do not use the allowance. A successful retry does. Browser Downloads counts completed downloads in this run and cannot check arbitrary existing files in its destination folder.
+The limit counts confirmed successful new saves in this run. For example, batch size **35** with limit **50** saves up to **35**, then **15**; already-saved files, duplicate discovery IDs, unavailable Reels, and failed attempts do not use the allowance. A successful retry does. Browser Downloads skips recognized earlier completed ReelNest downloads when duplicate skipping is enabled; files outside its retained Chrome history cannot be checked.
 
 The selection follows Instagram's returned profile order, which may include pinned items. A limit means **up to N new videos**, rather than a guarantee of the latest N or that N eligible videos exist. Instagram can return a complete page with more IDs than needed; surplus discovered items are deferred when the limit is reached. No further page or media lookup is scheduled after that point. **Limit reached** is distinct from finishing the whole profile, and reports preserve whether the source was actually exhausted.
 
@@ -192,7 +200,7 @@ npm run test:extension
 
 `test:profile` exercises the injected profile panel against local browser fixtures, including Instagram-style navigation and folder/download controls. The picker returns a real temporary origin-private directory handle. Media requests use fixtures, so the tests do not touch personal folders or Instagram accounts.
 
-`test:bulk` exercises the actual queue, panel, and stream writer against a local 82-item feed, including 35/35/12 batching, scan-all mode, pause/resume, retries, stops, lost acknowledgement recovery, and report import. It also checks custom-limit validation, cached/failed items, remaining allowance, and Stop/completion races. `test:extension` loads the unpacked extension into an isolated Edge/Chromium profile and checks worker/content messaging, real origin-private filesystem writes, cache skips without new media requests, missing-file recovery, reload persistence, and two-profile isolation. Its limit cases verify no extra page/media lookup after the cap, compatible reports, a lost failure acknowledgement followed by Resume, and Stop during media lookup. Instagram modules are fixtures; neither suite accesses your personal browser profile or account. Set `REEL_SAVER_BROWSER` to a compatible unpacked-extension-capable Chromium executable if needed.
+`test:bulk` exercises the actual queue, panel, and stream writer against a local 82-item feed, including 35/35/12 batching, scan-all mode, pause/resume, retries, stops, lost acknowledgement recovery, and report import. It also checks custom-limit validation, cached/failed items, remaining allowance, Stop/completion races, and consecutive limited Browser Downloads runs. `test:extension` loads the unpacked extension into an isolated Edge/Chromium profile and checks worker/content messaging, real origin-private filesystem writes, cache skips without new media requests, missing-file recovery, reload persistence, and two-profile isolation. Its limit cases verify no extra page/media lookup after the cap, compatible reports, a lost failure acknowledgement followed by Resume, and Stop during media lookup. A synthetic Chrome-download-history adapter additionally exercises the real worker/source/UI path for 25 saves followed by 10 different Reels and missing-file handling. Report exports go only into the temporary browser profile. Instagram modules and browser-history records are fixtures; neither suite accesses your personal browser profile or account. Set `REEL_SAVER_BROWSER` to a compatible unpacked-extension-capable Chromium executable if needed.
 
 Files:
 

@@ -31,7 +31,7 @@ const fixture = `(() => {
     jobNumber: 0, nextId: 0, browserState: 'complete',
     failItem: null, failCount: 0, holdPage: false, heldPages: [], holdResolve: false, heldResolves: [],
     failRelease: false, releaseCalls: 0, failAck: 0, failNegativeAck: 0, failTransfers: 0,
-    report: null, mp4Playable: false, completeOnCancel: false };
+    report: null, mp4Playable: false, completeOnCancel: false, browserHistory: [], failHistory: false };
   const pageStyles = new CSSStyleSheet();
   pageStyles.replaceSync('body{font:16px system-ui;background:#fafafa;color:#222;margin:0}main{max-width:920px;margin:40px auto}header{padding:20px;border-bottom:1px solid #ddd}h1{font-size:24px}');
   document.adoptedStyleSheets=[pageStyles];
@@ -65,6 +65,11 @@ const fixture = `(() => {
   const downloadOwners=new Map();
   const nativePrepared=state.nativePrepared=new Map();
   const success = result=>({ok:true,...result});
+  const browserCache = item=>{
+    if(state.job?.options.skipExisting===false)return null;
+    const record=state.browserHistory.find(record=>record.mediaId===item.mediaId&&record.profileId===profile.id&&record.download.state==='complete'&&record.download.exists&&record.download.fileSize>0);
+    return record?{cacheHit:true,filename:record.download.filename,bytesWritten:record.download.fileSize,downloadId:record.download.id,verification:'browser_history'}:null;
+  };
   const mediaFor=item=>({mediaId:item.mediaId,shortcode:item.shortcode,pageUrl:'https://www.instagram.com/reel/'+item.shortcode+'/',username:profile.username,width:32,height:32,url:'https://scontent.cdninstagram.com/'+item.shortcode+'.mp4?secret=never_export'});
   window.chrome=Object.assign(window.chrome||{},{runtime:{id:'fixture-extension',getURL:p=>'chrome-extension://fixture-extension/'+p,
     onMessage:{addListener:listener=>{state.messageListener=listener;}},sendMessage:async request=>{
@@ -79,6 +84,10 @@ const fixture = `(() => {
         if(state.holdPage)await new Promise(resolve=>state.heldPages.push(resolve));
         const start=Number(request.cursor||0);const page=items().slice(start,start+state.pageSize);const after=start+page.length;
         return success({profile,page:{items:page,nextCursor:after<state.total?String(after):null,hasMore:after<state.total}});
+      }
+      if(type==='REEL_SAVER_BULK_CHECK_EXISTING'){
+        if(state.failHistory)return {ok:false,error:{code:'CACHE_CHECK_FAILED',message:'Fixture browser history unavailable',stage:'cache'}};
+        return success({result:state.job?.options.destination==='downloads'?browserCache(request.item):null});
       }
       if(type==='REEL_SAVER_BULK_RESOLVE'){
         const key=request.jobId+':'+request.item.mediaId;
@@ -96,9 +105,11 @@ const fixture = `(() => {
         if(request.result.state==='saved')state.saved++;return success({});
       }
       if(type==='REEL_SAVER_BULK_DOWNLOAD'){
+        const cached=browserCache(request.item);if(cached)return success({alreadySaved:true,result:cached});
         state.downloads++;
         if(state.failItem===request.item.mediaId&&state.failCount++===0)return {ok:false,error:{code:'SAVE_FAILED',message:'A fixture transfer failed.',stage:'download',retryable:false}};
-        const download={id:++state.nextId,state:state.browserState,filename:profile.username+'_'+request.item.shortcode+'.mp4'};
+        const download={id:++state.nextId,state:state.browserState,filename:profile.username+'_'+request.item.shortcode+'.mp4',fileSize:2048,totalBytes:2048,exists:true};
+        state.browserHistory.push({mediaId:request.item.mediaId,profileId:profile.id,download});
         allDownloads.set(request.attemptId,download);downloadOwners.set(request.attemptId,{jobId:request.jobId,mediaId:request.item.mediaId});if(download.state==='complete')state.saved++;
         return success({download,filename:download.filename});
       }
@@ -338,7 +349,7 @@ try {
 
   await click(query('[data-role=bulk-mode]'));await key('Home','Home',36);await key('Enter','Enter',13);
   await waitFor("window.__fixture.mode==='batches'",'batch setting restored');
-  await evaluate('window.__fixture.total=2;window.__fixture.browserState="in_progress";window.__fixture.events=[]');
+  await evaluate('window.__fixture.total=2;window.__fixture.browserState="in_progress";window.__fixture.events=[];window.__fixture.browserHistory.length=0');
   await click(query('[data-role=bulk-start]'));
   await waitFor(`${query('[data-role=bulk-pause]')}.hidden===false`,'pause available');
   await click(query('[data-role=bulk-pause]'));
@@ -351,7 +362,7 @@ try {
   await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Completed.')`,'resume completes');
   console.log('PASS pause finishes current operation,resume avoids repeatedsaveditems');
 
-  await evaluate('window.__fixture.total=2;window.__fixture.failItem="100001";window.__fixture.failCount=0');
+  await evaluate('window.__fixture.total=2;window.__fixture.failItem="100001";window.__fixture.failCount=0;window.__fixture.browserHistory.length=0');
   await click(query('[data-role=bulk-start]'));
   await waitFor(`${query('[data-role=bulk-retry]')}.hidden===false`,'retry failed action');
   const beforeRetry=await evaluate('window.__fixture.downloads');
@@ -614,7 +625,7 @@ try {
   console.log('PASS strict limit validation, saved preferences, native cap excludes cache hits, no extra discovery, compatible limited report');
 
   await selectDestination('downloads');
-  await evaluate('window.__fixture.total=9;window.__fixture.browserState="in_progress";window.__fixture.events=[]');
+  await evaluate('window.__fixture.total=9;window.__fixture.browserState="in_progress";window.__fixture.events=[];window.__fixture.browserHistory.length=0');
   const downloadsBeforeLimitedPause=await evaluate('window.__fixture.downloads');
   await click(query('[data-role=bulk-start]'));
   await waitFor(`window.__fixture.downloads===${downloadsBeforeLimitedPause+1}`,'limited browser transfer accepted');
@@ -633,7 +644,7 @@ try {
 
   await click(query('[data-role=bulk-mode]'));await key('End','End',35);await key('Enter','Enter',13);
   await waitFor("window.__fixture.mode==='scan_all' && !document.querySelector('[data-reel-saver-panel]').shadowRoot.querySelector('[data-role=bulk-start]').disabled",'limited scan-all selected');
-  await evaluate('window.__fixture.total=27;window.__fixture.events=[]');
+  await evaluate('window.__fixture.total=27;window.__fixture.events=[];window.__fixture.browserHistory.length=0');
   const downloadsBeforeLimitedScan=await evaluate('window.__fixture.downloads');
   await click(query('[data-role=bulk-start]'));
   await waitFor(`${query('[data-role=bulk-start]')}.textContent==='Download up to 2 new Reels' && ${query('[data-role=bulk-limit]')}.disabled`,'limited full scan ready for approval');
@@ -646,7 +657,7 @@ try {
 
   await click(query('[data-role=bulk-mode]'));await key('Home','Home',36);await key('Enter','Enter',13);
   await waitFor(`window.__fixture.mode==='batches' && !${query('[data-role=bulk-start]')}.disabled`,'limited batch mode restored');
-  await evaluate('window.__fixture.total=4;window.__fixture.failItem="500001";window.__fixture.failCount=0');
+  await evaluate('window.__fixture.total=4;window.__fixture.failItem="500001";window.__fixture.failCount=0;window.__fixture.browserHistory.length=0');
   const downloadsBeforeLimitedFailure=await evaluate('window.__fixture.downloads');
   await click(query('[data-role=bulk-start]'));
   await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'failed item does not consume the cap');
@@ -656,7 +667,7 @@ try {
   assert.equal(await evaluate(`${query('[data-role=bulk-retry]')}.disabled`),true,'failed retries cannot exceed an exhausted cap');
   console.log('PASS failures do not consume allowance and Retry failed cannot exceed the finished cap');
 
-  await evaluate('window.__fixture.total=3;window.__fixture.failItem=null;window.__fixture.browserState="in_progress";window.__fixture.completeOnCancel=true;window.__fixture.report=null');
+  await evaluate('window.__fixture.total=3;window.__fixture.failItem=null;window.__fixture.browserState="in_progress";window.__fixture.completeOnCancel=true;window.__fixture.report=null;window.__fixture.browserHistory.length=0');
   const downloadsBeforeStopRace=await evaluate('window.__fixture.downloads');
   await click(query('[data-role=bulk-start]'));
   await waitFor(`window.__fixture.downloads===${downloadsBeforeStopRace+1}`,'browser transfer before Stop/completion race');
@@ -704,6 +715,64 @@ try {
   assert.equal(await evaluate('window.__fixture.nativePrepared.size'),0,'Stop releases the no-output prepared reservation');
   assert.equal(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_ITEM_RESULT'&&event.resultState==='canceled').length"),1);
   console.log('PASS Stop during a held native lookup acknowledges its late prepared response and releases without writing');
+
+  await selectDestination('downloads');
+  assert.equal(await evaluate(`${query('[data-role=skip-existing]')}.parentElement.hidden`),false,'Browser Downloads exposes duplicate skipping');
+  assert.equal(await evaluate(`${query('[data-role=skip-existing]')}.checked`),true,'browser history skipping defaults on');
+  await evaluate('window.__fixture.baseId=900001;window.__fixture.total=50;window.__fixture.browserState="complete";window.__fixture.completeOnCancel=false;window.__fixture.browserHistory.length=0;window.__fixture.events=[]');
+  await enterLimit('25');
+  await waitFor(`window.__fixture.maxNewVideos===25 && !${query('[data-role=bulk-start]')}.disabled`,'first browser limit saved');
+  const beforeHistoryRuns=await evaluate('window.__fixture.downloads');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'first 25 browser downloads');
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'25');
+  const firstRunIds=await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').map(event=>event.mediaId)");
+  assert.equal(firstRunIds.length,25);
+  await enterLimit('10');
+  await waitFor(`window.__fixture.maxNewVideos===10 && !${query('[data-role=bulk-start]')}.disabled`,'next ten browser limit saved');
+  await evaluate('window.__fixture.events=[];window.__fixture.report=null');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'next ten skip the first 25 completed browser downloads');
+  const secondRunIds=await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').map(event=>event.mediaId)");
+  assert.deepEqual(secondRunIds,Array.from({length:10},(_,index)=>String(900026+index)));
+  assert.ok(secondRunIds.every(id=>!firstRunIds.includes(id)),'second run saves ten distinct new IDs');
+  assert.equal(await evaluate('window.__fixture.downloads'),beforeHistoryRuns+35);
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'10');
+  assert.equal(await evaluate(`${query('[data-count=alreadyDownloaded]')}.textContent`),'25');
+  assert.equal(await evaluate('window.__fixture.job.options.skipExisting'),true);
+  await click(query('[data-role=bulk-report]'));
+  await waitFor('window.__fixture.report?.maxNewVideos===10','browser history report exported');
+  assert.equal(await evaluate('window.__fixture.report.destination'),'downloads');
+  assert.equal(await evaluate('window.__fixture.report.skipExisting'),true);
+  assert.equal(await evaluate('window.__fixture.report.counts.alreadyDownloaded'),25);
+  console.log('PASS Browser Downloads saves 25, then skips them and saves the next ten distinct Reels with an accurate report');
+
+  await enterLimit('1');
+  await waitFor(`window.__fixture.maxNewVideos===1 && !${query('[data-role=bulk-start]')}.disabled`,'one-save recovery limit');
+  await evaluate('window.__fixture.browserHistory[0].download.exists=false;window.__fixture.events=[]');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'missing browser file is eligible again');
+  assert.deepEqual(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').map(event=>event.mediaId)"),['900001']);
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'1');
+  console.log('PASS a missing Browser Downloads file is downloaded again while existing history entries remain skipped');
+
+  await evaluate('window.__fixture.failHistory=true;window.__fixture.events=[]');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-start]')}.textContent==='Resume' && !${query('[data-role=bulk-start]')}.disabled`,'browser history error pauses discovery');
+  assert.equal(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').length"),0,'a history failure never silently downloads duplicate files');
+  await evaluate('window.__fixture.failHistory=false');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'browser history check recovers');
+  assert.deepEqual(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').map(event=>event.mediaId)"),['900036']);
+  await click(query('[data-role=skip-existing]'));
+  await evaluate('window.__fixture.events=[]');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'duplicate skipping can be explicitly disabled');
+  assert.equal(await evaluate('window.__fixture.job.options.skipExisting'),false);
+  assert.equal(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_CHECK_EXISTING').length"),0);
+  assert.deepEqual(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').map(event=>event.mediaId)"),['900001']);
+  assert.equal(await evaluate(`${query('[data-count=alreadyDownloaded]')}.textContent`),'0');
+  console.log('PASS history failures pause safely and an explicit skip-off run can save another copy');
 
   assert.deepEqual(exceptions,[],'no uncaught browser exceptions');
   console.log('Screenshot: artifacts/bulk-panel-preview.png');

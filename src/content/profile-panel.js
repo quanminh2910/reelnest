@@ -210,7 +210,7 @@
     chooseFolder.disabled = !settingsLoaded || busy || savingSettings || !globalThis.ReelSaverFolderWriter?.isSupported();
     refresh.disabled = busy || inspecting;
     download.disabled = busy || inspecting || savingSettings || !settingsLoaded || !currentMedia || currentRoute?.type !== "reel";
-    skipLabel.hidden = selectedDestination !== "chosen";
+    skipLabel.hidden = selectedDestination === "ask";
     skipExisting.checked = skipAlreadyDownloaded;
     skipExisting.disabled = busy;
     historyRetry.hidden = historyNotice.hidden = !nativeReceipt;
@@ -227,7 +227,7 @@
       destinationHint.textContent = "Chrome will open its Save As dialog when you download.";
     } else {
       folderName.textContent = "Downloads / Reel Saver";
-      destinationHint.textContent = "Uses your browser’s download folder. Existing files get unique names.";
+      destinationHint.textContent = "Profile downloads can skip completed ReelNest downloads in Chrome history. Files outside that history are not checked; additional copies get unique names.";
     }
     if (!globalThis.ReelSaverFolderWriter?.isSupported()) {
       chooseFolder.title = "This browser does not support choosing a folder here. Use Ask where to save instead.";

@@ -147,6 +147,7 @@ try {
       }, message.sessionId).catch(error => exceptions.push(error.message));
     }
   });
+  await send('Browser.setDownloadBehavior',{behavior:'allow',downloadPath:path.join(profile,'downloads')});
   const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
   const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
   const page = (method, params = {}) => send(method, params, sessionId);
@@ -399,6 +400,60 @@ try {
   await setLimit(null);
   assert.equal(await evaluate(`${query('[data-role=bulk-limit-mode]')}.value`),'unlimited');
   console.log('PASS custom limit persists as a preference and can return to Unlimited');
+
+  // Keep real runtime/storage/scripting and use synthetic Chrome download
+  // records for the browser destination. No external network or user folder.
+  await page('Page.reload');
+  await reconnectFixture('browser history regression profile');
+  await selectDestination('downloads');
+  const workerEval=async expression=>{
+    const result=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true},workerSession);
+    if(result.exceptionDetails)throw new Error(result.exceptionDetails.exception?.description||result.exceptionDetails.text);
+    return result.result.value;
+  };
+  await workerEval(`(() => {
+    const records=globalThis.__browserHistoryFixture=[];
+    chrome.downloads.download=async options=>{
+      const id=records.length+1000;
+      records.push({id,byExtensionId:chrome.runtime.id,filename:'C:/Fixture Downloads/'+options.filename,
+        url:options.url,finalUrl:options.url,state:'complete',mime:'video/mp4',exists:true,
+        fileSize:2048,totalBytes:2048,bytesReceived:2048,startTime:new Date().toISOString()});
+      return id;
+    };
+    chrome.downloads.search=async query=>{
+      const matches=records.filter(item=>(query.id==null||item.id===query.id)&&
+        (!query.state||item.state===query.state)&&(query.exists===undefined||item.exists===query.exists)&&
+        (!query.filenameRegex||new RegExp(query.filenameRegex).test(item.filename)));
+      return structuredClone(matches.slice().reverse().slice(0,query.limit||matches.length));
+    };
+  })()`);
+  await setLimit(25);
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'first 25 browser saves');
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),25);
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),25);
+  const firstBrowserFiles=await workerEval('globalThis.__browserHistoryFixture.map(item=>item.filename)');
+  await setLimit(10);
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'next 10 browser saves after 25 history hits');
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),35);
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),10);
+  assert.equal(Number(await evaluate(`${query('[data-count=alreadyDownloaded]')}.textContent`)),25);
+  const nextBrowserFiles=await workerEval('globalThis.__browserHistoryFixture.slice(25).map(item=>item.filename)');
+  assert.equal(nextBrowserFiles.some(filename=>firstBrowserFiles.includes(filename)),false,'second run downloads 10 different Reels');
+  console.log('PASS installed browser-destination regression: 25 saved, then 25 history hits and 10 distinct new Reels');
+
+  await page('Page.reload');
+  await reconnectFixture('browser history after tab reload');
+  await selectDestination('downloads');
+  await setLimit(1);
+  await workerEval('globalThis.__browserHistoryFixture[0].exists=false');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'missing browser file remains eligible after reload');
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),36);
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.at(-1).filename'),firstBrowserFiles[0]);
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),1);
+  console.log('PASS browser history survives a new job/tab document and Chrome-reported missing files can download again');
   const artifacts=path.join(root,'artifacts');await mkdir(artifacts,{recursive:true});
   const capture=await page('Page.captureScreenshot',{format:'png'});
   await writeFile(path.join(artifacts,'bulk-extension-preview.png'),Buffer.from(capture.data,'base64'));

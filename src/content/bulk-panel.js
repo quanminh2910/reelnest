@@ -15,6 +15,8 @@
     return {
       version: 1, jobId: snapshot.jobId, profile: snapshot.profile, mode: snapshot.mode, batchSize: snapshot.batchSize,
       maxNewVideos: snapshot.maxNewVideos ?? null, committedNewSaves: snapshot.committedNewSaves ?? snapshot.counts.saved,
+      ...(["folder", "downloads"].includes(snapshot.destination) ? { destination: snapshot.destination } : {}),
+      ...(typeof snapshot.skipExisting === "boolean" ? { skipExisting: snapshot.skipExisting } : {}),
       ...(snapshot.completionReason ? { completionReason: snapshot.completionReason } : {}),
       state: snapshot.state, sourceExhausted: snapshot.sourceExhausted, startedAt: snapshot.startedAt, endedAt: snapshot.endedAt,
       phase: snapshot.phase,
@@ -182,9 +184,12 @@
       try { configuredLimit = selectedLimit(); } catch { validLimit = false; }
       limitInput.setAttribute("aria-invalid", String(!validLimit));
       scopeBadge.textContent = limitModeValue === "custom" ? "LIMITED" : "ALL REELS";
-      const countHelp = getDestination().kind === "folder"
-        ? "Already saved videos and failed downloads do not use the limit."
-        : "Failed downloads do not use the limit. Existing files in Browser Downloads are not checked.";
+      const skipping = active && jobDestination ? jobDestination.skipExisting : getSkipExisting();
+      const countHelp = !skipping
+        ? "Duplicate skipping is off. Each completed copy counts toward the limit."
+        : getDestination().kind === "folder"
+          ? "Already saved videos and failed downloads do not use the limit."
+          : "Completed ReelNest downloads in Chrome history are skipped and do not use the limit. Files outside that history are not checked.";
       limitHint.textContent = snapshot && active && snapshot.maxNewVideos != null
         ? `This run: ${snapshot.committedNewSaves ?? snapshot.counts.saved} of ${snapshot.maxNewVideos} new videos saved. ${countHelp}`
         : `Counts successful saves in this run. ${countHelp}`;
@@ -437,6 +442,7 @@
         if (signal.aborted) await cancelBrowser(job.jobId, item, attemptId);
         throw cause;
       }
+      if (response.alreadySaved) return response.result;
       let info = response.download;
       if (!info) throw error("RECONCILIATION_REQUIRED", "Chrome's download result is uncertain. Pause and check Downloads before retrying.");
       const cancel = () => { cancelBrowser(job.jobId, item, attemptId); };
@@ -469,10 +475,12 @@
           if (signal.aborted) throw aborted();
           return response.page;
         },
-        ...(jobDestination?.kind === "folder" && jobDestination.skipExisting ? {
+        ...(jobDestination?.skipExisting ? {
           checkExisting: async ({ item, signal }) => {
             if (signal.aborted) throw aborted();
-            const result = await jobDestination.cache.verifyItem(item);
+            const result = jobDestination.kind === "folder"
+              ? await jobDestination.cache.verifyItem(item)
+              : (await request({ type: M + "CHECK_EXISTING", jobId: workerJob.jobId, item })).result;
             if (signal.aborted) throw aborted();
             return result;
           },
@@ -503,6 +511,7 @@
       }
       const route = readRoute();
       const target = getDestination();
+      const skipExisting = getSkipExisting() !== false;
       if (route?.type !== "profile") return;
       let maxNewVideos;
       try { maxNewVideos = selectedLimit(); }
@@ -519,14 +528,14 @@
       let controllerStarted = false;
       try {
         if (workerJob && !terminalNotified) await request({ type: M + "END", jobId: workerJob.jobId, state: snapshot?.state || "stopped" });
-        const response = await request({ type: M + "START", options: { mode: modeValue, batchSize: batchValue, destination: target.kind, maxNewVideos } });
+        const response = await request({ type: M + "START", options: { mode: modeValue, batchSize: batchValue, destination: target.kind, maxNewVideos, skipExisting } });
         workerJob = response.job;
         registeredJob = workerJob;
         retryRetired = false;
         if (!workerJob?.jobId || !workerJob.profile?.id) throw new Error("The profile could not be identified. Reload it and try again.");
         snapshot = null;
         controller = null;
-        jobDestination = { ...target, skipExisting: getSkipExisting() };
+        jobDestination = { ...target, skipExisting };
         terminalNotified = false;
         releaseFailed = false;
         releaseError = null;
@@ -822,7 +831,7 @@
     });
     report.addEventListener("click", event => {
       if (!event.isTrusted || !snapshot) return;
-      const reportData = buildReport(snapshot);
+      const reportData = buildReport({ ...snapshot, destination: jobDestination?.kind, skipExisting: jobDestination?.skipExisting });
       const url = URL.createObjectURL(new Blob([JSON.stringify(reportData, null, 2)], { type: "application/json" }));
       const link = make("a", "", { href: url, download: `reelnest-${snapshot.profile.username}-${snapshot.jobId}-report.json` });
       link.click();

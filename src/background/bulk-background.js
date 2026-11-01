@@ -1,5 +1,5 @@
 import { profileSource } from "../instagram/profile-source.js";
-import { buildFilename, validateMedia, summarizeDownload } from "../shared/core.js";
+import { buildFilename, validateMedia, summarizeDownload, sanitizeFilenamePart, isInstagramMediaUrl } from "../shared/core.js";
 import "../shared/download-limits.js";
 
 const limits = globalThis.ReelSaverDownloadLimits;
@@ -12,11 +12,12 @@ const operationKey = (jobId, id) => `${prefix(jobId)}operation:${id}`;
 const cancellationKey = (jobId, id, attemptId) => `${operationKey(jobId, id)}:${attemptId}`;
 const pending = new Map();
 const canceled = new Set();
+const MAX_HISTORY_CANDIDATES = 200;
 let registration = Promise.resolve();
 let journal = Promise.resolve();
 const actions = new Set([
   "START", "PAGE", "RESOLVE", "DOWNLOAD", "STATUS", "CANCEL_ITEM", "ITEM_RESULT",
-  "END", "REOPEN", "HEARTBEAT", "IDENTIFY", "SETTINGS_GET", "SETTINGS_SET",
+  "END", "REOPEN", "HEARTBEAT", "IDENTIFY", "SETTINGS_GET", "SETTINGS_SET", "CHECK_EXISTING",
 ].map((action) => `REEL_SAVER_BULK_${action}`));
 
 export const isBulkMessage = (message) => actions.has(message?.type);
@@ -82,11 +83,12 @@ function context(sender) {
 function options(value) {
   if (!value || !["batches", "scan_all"].includes(value.mode) ||
       !Number.isSafeInteger(value.batchSize) || value.batchSize < 1 || value.batchSize > 500 ||
-      !["folder", "downloads"].includes(value.destination)) {
+      !["folder", "downloads"].includes(value.destination) ||
+      (value.skipExisting !== undefined && typeof value.skipExisting !== "boolean")) {
     throw problem("INVALID_SETTINGS", "Choose a download mode, a batch size from 1 to 500, and a folder or Downloads.");
   }
   return { mode: value.mode, batchSize: value.batchSize, destination: value.destination,
-    maxNewVideos: limits.normalize(value.maxNewVideos) };
+    maxNewVideos: limits.normalize(value.maxNewVideos), skipExisting: value.skipExisting !== false };
 }
 
 async function get(key) { return (await chrome.storage.session.get(key))[key]; }
@@ -260,14 +262,18 @@ function attempt(value) {
   return value;
 }
 
-async function member(ctx, message, allowInactive = false, requireProfile = true) {
+async function knownMember(ctx, message, allowInactive = false, requireProfile = true) {
   const job = await currentJob(ctx, message.jobId, { inactive: allowInactive, profile: requireProfile });
   const item = checkItem(message.item || { mediaId: message.mediaId, shortcode: "_" });
   const known = await get(memberKey(job.jobId, item.mediaId));
   if (!known || (message.item && known.shortcode !== item.shortcode)) {
     throw problem("INVALID_ITEM", "This Reel was not discovered for the current profile batch.");
   }
-  return { job, item: known, attemptId: attempt(message.attemptId) };
+  return { job, item: known };
+}
+
+async function member(ctx, message, allowInactive = false, requireProfile = true) {
+  return { ...await knownMember(ctx, message, allowInactive, requireProfile), attemptId: attempt(message.attemptId) };
 }
 
 async function restoreTab(job) {
@@ -368,6 +374,60 @@ async function getOwnDownload(id) {
     ...(Number.isFinite(item.fileSize) && item.fileSize >= 0 ? { bytesWritten: item.fileSize } : {}) };
 }
 
+const escapePattern = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+async function existingBrowserDownload(ctx, job, item) {
+  if (job.options.skipExisting === false) return null;
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const numericId = [...item.shortcode].reduce((value, character) => value * 64n + BigInt(alphabet.indexOf(character)), 0n).toString();
+  if (numericId !== item.mediaId || item.shortcode.length > 1 && item.shortcode.startsWith("A")) {
+    throw problem("INVALID_ITEM", "This Reel's shortcode does not match its numeric identity.", "history");
+  }
+  // Older releases trimmed leading/trailing underscores from shortcodes when
+  // naming files. Those legacy names cannot prove which Reel was saved.
+  if (sanitizeFilenamePart(item.shortcode) !== item.shortcode) return null;
+  const author = sanitizeFilenamePart(job.profile.username) || "reel";
+  const foldedAuthor = [...author].map(character => /[A-Za-z]/.test(character)
+    ? `[${character.toLowerCase()}${character.toUpperCase()}]` : escapePattern(character)).join("");
+  const suffix = `${escapePattern(item.shortcode)}(?: \\([1-9][0-9]*\\))?\\.mp4$`;
+  const filenameRegex = `(?:^|[\\\\/])${foldedAuthor}_${suffix}`;
+  const basenamePattern = new RegExp(`^(.+)_${suffix}`);
+  let matches;
+  try {
+    matches = await chrome.downloads.search({ state: "complete", exists: true, filenameRegex,
+      limit: MAX_HISTORY_CANDIDATES + 1, orderBy: ["-startTime"] });
+  } catch {
+    throw problem("CACHE_HISTORY_UNAVAILABLE", "Chrome's download history could not be checked. Retry before downloading more videos.", "history");
+  }
+  await currentJob(ctx, job.jobId);
+  if (!Array.isArray(matches) || matches.length > MAX_HISTORY_CANDIDATES) {
+    throw problem("CACHE_HISTORY_LIMIT", "Too many matching download records were returned. Check Chrome Downloads or use a Library folder before retrying.", "history");
+  }
+  for (const download of matches) {
+    const filename = typeof download?.filename === "string" ? download.filename.replaceAll("\\", "/").split("/").pop() : "";
+    const name = basenamePattern.exec(filename);
+    if (download?.byExtensionId !== chrome.runtime.id || !Number.isInteger(download.id) || download.id < 0 ||
+        download.state !== "complete" || download.exists !== true || !Number.isSafeInteger(download.fileSize) || download.fileSize <= 0 ||
+        typeof download.mime !== "string" || !/^(video\/mp4|application\/(octet-stream|mp4))(?:;|$)/i.test(download.mime) ||
+        !isInstagramMediaUrl(download.url, { video: true }) ||
+        download.finalUrl && !isInstagramMediaUrl(download.finalUrl, { video: true }) ||
+        !name || name[1].toLowerCase() !== author.toLowerCase()) continue;
+    return { cacheHit: true, filename, bytesWritten: download.fileSize, downloadId: download.id, verification: "browser_history" };
+  }
+  return null;
+}
+
+async function checkExisting(ctx, message) {
+  const { job, item } = await knownMember(ctx, message);
+  if (job.options.destination !== "downloads") throw problem("INVALID_DESTINATION", "Use the selected library's file history for folder saves.");
+  // Own-run receipts must be reconciled as new saves, including after a lost
+  // acknowledgement. They must never become history hits for the same run.
+  if (pending.has(operationKey(job.jobId, item.mediaId)) || await get(operationKey(job.jobId, item.mediaId))) {
+    return { ok: true, result: null };
+  }
+  return { ok: true, result: await existingBrowserDownload(ctx, job, item) };
+}
+
 async function reconcile(operation) {
   if (Number.isInteger(operation.downloadId)) {
     const download = await getOwnDownload(operation.downloadId);
@@ -408,6 +468,10 @@ async function resolve(ctx, message, browser = false) {
     }
     if (previous?.state === "saved" && !browser) return { ok: true, alreadySaved: true,
       filename: previous.filename, result: { filename: previous.filename, ...(previous.bytesWritten != null ? { bytesWritten: previous.bytesWritten } : {}) } };
+    if (browser) {
+      const existing = await existingBrowserDownload(ctx, job, item);
+      if (existing) return { ok: true, alreadySaved: true, result: existing };
+    }
     const cancelKey = cancellationKey(job.jobId, item.mediaId, attemptId);
     if (canceled.has(cancelKey)) throw problem("SAVE_CANCELLED", "The download was canceled.");
     await reserveOperation(ctx, job.jobId, item, attemptId);
@@ -602,6 +666,7 @@ export async function handleBulkMessage(message, sender) {
     }
     if (action === "START") return await start(ctx, message);
     if (action === "PAGE") return await page(ctx, message);
+    if (action === "CHECK_EXISTING") return await checkExisting(ctx, message);
     if (action === "RESOLVE") return await resolve(ctx, message, false);
     if (action === "DOWNLOAD") return await resolve(ctx, message, true);
     if (action === "STATUS") return await operationStatus(ctx, message);
