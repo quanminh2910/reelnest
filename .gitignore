@@ -1,0 +1,46 @@
+# Generated screenshots, diagnostics, and test output
+/artifacts/
+/coverage/
+/.nyc_output/
+
+# Local implementation plans
+/plans/
+
+# Dependencies and tool caches
+node_modules/
+.cache/
+*.log
+
+# Local environment files and signing credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Packaged extension releases
+*.zip
+*.crx
+
+# Downloaded videos, profile caches, and exported reports
+*.mp4
+*.m4v
+*.webm
+*.mov
+*.mkv
+.reel-saver-*.json
+reel-saver-*-report.json
+reelnest-*-report.json
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~

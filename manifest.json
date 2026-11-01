@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "ReelNest",
+  "version": "0.4.2",
+  "description": "Save Instagram Reels to profile libraries with download history, duplicate skipping, and pause/resume.",
+  "minimum_chrome_version": "111",
+  "permissions": ["activeTab", "scripting", "downloads", "storage"],
+  "host_permissions": ["https://www.instagram.com/*", "https://instagram.com/*"],
+  "content_scripts": [{
+    "matches": ["https://www.instagram.com/*", "https://instagram.com/*"],
+    "js": ["src/content/folder-writer.js", "src/content/profile-cache.js", "src/content/bulk-queue.js", "src/content/bulk-panel.js", "src/content/profile-panel.js"],
+    "run_at": "document_idle",
+    "all_frames": false
+  }],
+  "background": {
+    "service_worker": "src/background/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "ReelNest",
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; style-src 'self'; img-src 'self' https://*.cdninstagram.com https://*.fbcdn.net https://www.instagram.com https://instagram.com; connect-src 'none'; base-uri 'none'; form-action 'none'"
+  }
+}

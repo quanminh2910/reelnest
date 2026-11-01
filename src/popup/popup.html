@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>ReelNest</title>
+    <link rel="stylesheet" href="popup.css">
+    <script type="module" src="popup.js"></script>
+  </head>
+  <body>
+    <header class="header">
+      <div class="brand">
+        <img class="brand-icon" src="../../icons/icon.svg" alt="" width="40" height="40">
+        <div>
+          <h1>ReelNest</h1>
+          <p class="tagline">Keep the moment.</p>
+        </div>
+      </div>
+      <span class="platform">Instagram</span>
+    </header>
+
+    <main>
+      <div class="section-heading">
+        <span>Current Reel</span>
+        <span class="format-badge">MP4</span>
+      </div>
+
+      <section id="reel-card" class="reel-card" aria-busy="true" aria-label="Current Reel">
+        <div id="preview" class="preview">
+          <img id="thumbnail" class="thumbnail" alt="" referrerpolicy="no-referrer" hidden>
+          <div id="preview-placeholder" class="preview-placeholder">
+            <svg class="reel-glyph" width="40" height="40" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+              <rect x="7" y="5" width="26" height="30" rx="8" stroke="currentColor" stroke-width="1.5"/>
+              <path d="m17 14 9 6-9 6V14Z" fill="currentColor"/>
+              <path d="M8 12h24M13 6l4 6m6-6 4 6" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <span id="preview-label">A little moment worth keeping.</span>
+          </div>
+          <span class="preview-label" aria-hidden="true">REEL</span>
+        </div>
+        <div class="reel-details">
+          <h2 id="reel-title">Finding your Reel…</h2>
+          <p id="reel-meta">Keep this Instagram tab open.</p>
+        </div>
+      </section>
+
+      <div id="status" class="status" data-tone="neutral" role="status" aria-live="polite" aria-atomic="true">
+        <span id="status-indicator" class="status-indicator is-spinning" aria-hidden="true"></span>
+        <p id="status-message">Checking the current page…</p>
+      </div>
+
+      <button id="download-button" class="download-button" type="button" disabled>
+        <svg id="button-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 3v12m-5-5 5 5 5-5M5 16v4h14v-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span id="button-label">Finding Reel…</span>
+      </button>
+
+      <p class="destination">
+        <svg width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path d="M2.5 6a1.5 1.5 0 0 1 1.5-1.5h4L10 7h6a1.5 1.5 0 0 1 1.5 1.5V15a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 15V6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+        </svg>
+        Uses your browser save location
+      </p>
+    </main>
+
+    <footer>Save the Reel you have open.</footer>
+  </body>
+</html>

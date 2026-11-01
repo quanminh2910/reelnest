@@ -1,0 +1,65 @@
+:root {
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  color: #172d29;
+  background: #fafcfb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  width: 372px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 24px 24px 21px;
+  border-bottom: 1px solid #e8eeeb;
+  background: #fff;
+}
+
+.brand { display: flex; align-items: center; gap: 11px; }
+.brand-icon { flex: none; border-radius: 12px; }
+h1 { margin: 0; font-size: 19px; line-height: 1.25; letter-spacing: -.65px; font-weight: 750; }
+.tagline { margin: 3px 0 0; color: #73827d; font-size: 11px; }
+.platform { padding: 4px 8px; border: 1px solid #e5ece8; border-radius: 6px; font-size: 10px; font-weight: 600; color: #65756e; }
+main { padding: 21px 24px 0; }
+.section-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 11px; color: #6e8178; font-size: 10px; font-weight: 700; letter-spacing: 1.15px; text-transform: uppercase; }
+.format-badge { padding: 1px 5px; border: 1px solid #dce7e1; border-radius: 4px; font-size: 9px; letter-spacing: .6px; }
+.reel-card { overflow: hidden; border: 1px solid #e0e8e2; border-radius: 13px; background: #fff; box-shadow: 0 3px 12px #1b433608; }
+.preview { position: relative; display: grid; place-items: center; width: 100%; height: 173px; overflow: hidden; background: #173d34; }
+.preview::before { position: absolute; inset: 0; content: ""; background: radial-gradient(ellipse at 75% 10%, #60b19628, transparent 70%), radial-gradient(ellipse at 10% 100%, #9fd1ae1f, transparent 65%); pointer-events: none; }
+.thumbnail { position: relative; width: 100%; height: 100%; object-fit: contain; background: #102c25; }
+.preview-placeholder { display: flex; flex-direction: column; gap: 12px; align-items: center; position: relative; color: #d2e6db; }
+.reel-glyph { opacity: .85; }
+.preview-placeholder span { font-size: 11px; color: #a5c5b7; }
+.preview-label { position: absolute; bottom: 12px; left: 13px; padding: 3px 7px; border: 1px solid #ffffff2e; border-radius: 5px; background: #142b266b; color: #fff; font-size: 8px; font-weight: 700; letter-spacing: 1px; }
+.reel-details { padding: 15px 16px 16px; }
+h2 { overflow: hidden; margin: 0; color: #203f32; font-size: 15px; font-weight: 650; letter-spacing: -.25px; text-overflow: ellipsis; white-space: nowrap; }
+.reel-details p { overflow: hidden; margin: 4px 0 0; color: #78867e; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.status { display: flex; gap: 9px; align-items: flex-start; min-height: 48px; margin-top: 15px; color: #677b70; }
+.status p { margin: 0; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.status-indicator { flex: none; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: #7d9b8c; }
+.status[data-tone="error"] { color: #9c493a; }
+.status[data-tone="error"] .status-indicator { background: #c97965; }
+.status[data-tone="success"] { color: #2e7655; }
+.status[data-tone="success"] .status-indicator { background: #519d73; }
+.status-indicator.is-spinning { width: 11px; height: 11px; margin-top: 3px; border: 1.5px solid #d6e4da; border-top-color: #3d775d; background: transparent; animation: spin .8s linear infinite; }
+.download-button { display: flex; justify-content: center; align-items: center; gap: 9px; width: 100%; min-height: 46px; padding: 12px 16px; border: none; border-radius: 9px; background: #1c523e; color: #fff; font: inherit; font-size: 13px; font-weight: 650; cursor: pointer; transition: background .15s, transform .15s; }
+.download-button:hover:not(:disabled) { background: #143e2e; }
+.download-button:active:not(:disabled) { transform: translateY(1px); }
+.download-button:focus-visible { outline: 3px solid #71b790; outline-offset: 3px; }
+.download-button:disabled { background: #e4ece6; color: #81948a; cursor: default; }
+.download-button[data-complete="true"] { background: #e3f1e7; color: #37764c; }
+.destination { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 11px 0 20px; color: #89968e; font-size: 10px; }
+footer { padding: 13px 24px 15px; border-top: 1px solid #e8eeeb; color: #93a198; font-size: 10px; text-align: center; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { *, *::before { animation: none !important; transition: none !important; } }
