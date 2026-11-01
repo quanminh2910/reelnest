@@ -189,16 +189,20 @@
         ? "Duplicate skipping is off. Each completed copy counts toward the limit."
         : getDestination().kind === "folder"
           ? "Already saved videos and failed downloads do not use the limit."
-          : "Completed ReelNest downloads in Chrome history are skipped and do not use the limit. Files outside that history are not checked.";
+          : "Saved Reels are recognized by profile and video, then checked in Chrome history. Already saved videos do not use the limit.";
       limitHint.textContent = snapshot && active && snapshot.maxNewVideos != null
         ? `This run: ${snapshot.committedNewSaves ?? snapshot.counts.saved} of ${snapshot.maxNewVideos} new videos saved. ${countHelp}`
         : `Counts successful saves in this run. ${countHelp}`;
-      history.hidden = getDestination().kind !== "folder";
+      const browserHistory = getDestination().kind === "downloads";
+      history.hidden = !["folder", "downloads"].includes(getDestination().kind);
+      if (browserHistory) historyInfo.textContent = "Download receipts keep coauthored Reels and changed profile names recognizable. Import an older report to record verified earlier downloads.";
+      else if (historyInfo.textContent.startsWith("Download receipts")) historyInfo.textContent = "Downloads are organized into a profile folder with persistent history.";
       importButton.disabled = active || isSingleBusy() || readRoute()?.type !== "profile";
       importCommit.hidden = importCancel.hidden = !importContext;
       importCommit.disabled = importing || !importContext?.preview;
-      importCancel.disabled = false;
+      importCancel.disabled = !!importContext?.releasePromise;
       importCancel.textContent = importing ? "Cancel import" : "Cancel";
+      clearButton.hidden = browserHistory;
       clearButton.disabled = active || isSingleBusy() || readRoute()?.type !== "profile";
       clearConfirm.hidden = clearCancel.hidden = clearSummary.hidden = !clearContext;
       clearConfirm.disabled = clearCancel.disabled = clearingHistory;
@@ -569,7 +573,7 @@
     }
     function atClearProfile(profile) {
       const route = readRoute();
-      return route?.type === "profile" && route.username.toLowerCase() === profile.username.toLowerCase();
+      return route?.type === "profile" && typeof profile?.username === "string" && route.username.toLowerCase() === profile.username.toLowerCase();
     }
     function closeClearContext() {
       const context = clearContext;
@@ -648,11 +652,34 @@
     }
     async function closeImport() {
       if (!importContext) return;
-      await request({ type: M + "END", jobId: importContext.job.jobId, state: "stopped" });
-      importContext.cache?.close();
-      importContext = null;
-      importAbortController = null;
-      importSummary.hidden = true;
+      const context = importContext;
+      if (context.releasePromise) return context.releasePromise;
+      const releasing = (async () => {
+        if (context.kind === "downloads") {
+          await request({ type: M + "BROWSER_IMPORT_CANCEL", ...(context.previewId ? { previewId: context.previewId } : {}) });
+        } else await request({ type: M + "END", jobId: context.job.jobId, state: "stopped" });
+        context.cache?.close();
+        if (importContext === context) {
+          importContext = null;
+          importAbortController = null;
+          importSummary.hidden = true;
+        }
+      })();
+      context.releasePromise = releasing;
+      try { await releasing; }
+      finally { if (context.releasePromise === releasing) context.releasePromise = null; }
+    }
+    async function cancelBrowserImport(context, message = "Import canceled. Recorded history and video files were kept.") {
+      if (context.cancelRequested) return;
+      context.cancelRequested = true;
+      importAbortController?.abort();
+      const releasing = closeImport();
+      update(); onBusyChange();
+      try { await releasing; setMessage(message); }
+      catch (cause) {
+        context.cancelRequested = false;
+        setMessage(cause.message || "The import could not be released. Click Cancel to retry.", "error");
+      } finally { update(); onBusyChange(); }
     }
     async function previewImport(event) {
       if (!event?.isTrusted || busy() || isSingleBusy()) return;
@@ -660,7 +687,8 @@
       importFile.value = "";
       if (!file) return;
       const target = getDestination();
-      if (target.kind !== "folder" || !target.handle || readRoute()?.type !== "profile") return;
+      const originalUsername = readRoute()?.username;
+      if (!["folder", "downloads"].includes(target.kind) || target.kind === "folder" && !target.handle || readRoute()?.type !== "profile") return;
       importing = true;
       importAbortController = new AbortController();
       const signal = importAbortController.signal;
@@ -668,16 +696,31 @@
       setMessage("Checking the report and the saved files…");
       let registered = null;
       let cache = null;
+      let browserPreviewRequested = false;
       try {
         if (file.size > 16 * 1024 * 1024) throw new Error("This report is too large. Choose a ReelNest report smaller than 16 MB.");
         let report;
         try { report = JSON.parse(await file.text()); }
         catch { throw new Error("This file is not a valid JSON download report."); }
+        if (target.kind === "downloads") {
+          browserPreviewRequested = true;
+          const response = await request({ type: M + "BROWSER_IMPORT_PREVIEW", report });
+          if (!response.previewId || !response.profile?.id || !response.summary) throw new Error("The browser history preview could not be confirmed. Cancel and try again.");
+          importContext = { kind: "downloads", previewId: response.previewId, profile: response.profile, target, preview: response.summary };
+          retryRetired = true;
+          if (signal.aborted || !atClearProfile(response.profile)) throw new Error("The profile changed. The unconfirmed browser history import was canceled.");
+          const result = response.summary;
+          importSummary.textContent = `@${response.profile.username}: ${result.saved} saved entries; ${result.ready} verified and ready to record. ${result.alreadyRecorded} already recorded; ${result.missing} missing; ${result.conflicts} need review. Videos stay in their current locations.`;
+          importSummary.hidden = false;
+          importCommit.textContent = "Record verified history";
+          setMessage("Review the Chrome-verified downloads above, then record their history. This does not download or copy videos.");
+          return;
+        }
         const response = await request({ type: M + "START", options: { mode: "batches", batchSize: batchValue, destination: "folder" } });
         registered = response.job;
         if (!registered?.jobId || !registered.profile?.id) throw new Error("The profile could not be identified. Reload it and try again.");
         retryRetired = true;
-        importContext = { job: registered, cache: null, target, preview: null };
+        importContext = { kind: "folder", job: registered, cache: null, target, preview: null };
         update();
         cache = await globalThis.ReelSaverProfileCache.openLibrary(target.handle, registered.profile);
         importContext.cache = cache;
@@ -696,6 +739,16 @@
         } else {
           cache?.close();
           if (registered?.jobId) await request({ type: M + "END", jobId: registered.jobId, state: "stopped" }).catch(() => {});
+          if (browserPreviewRequested) {
+            try { await request({ type: M + "BROWSER_IMPORT_CANCEL" }); }
+            catch (releaseError) {
+              if (!["STALE_JOB", "INVALID_JOB", "IMPORT_MISSING", "BROWSER_IMPORT_MISSING"].includes(releaseError.code)) {
+                importContext = { kind: "downloads", profile: { username: originalUsername }, target, preview: null };
+                importSummary.textContent = "The browser history preview could not be released. Click Cancel to retry before starting another operation.";
+                importSummary.hidden = false;
+              }
+            }
+          }
         }
         setMessage(cause.message || "The report could not be checked.", cause.code === "CACHE_IMPORT_CANCELLED" ? "neutral" : "error");
       } finally {
@@ -706,7 +759,8 @@
     }
     async function commitImport(event) {
       if (!event?.isTrusted || importing || !importContext?.preview) return;
-      if (readRoute()?.username?.toLowerCase() !== importContext.job.profile.username.toLowerCase()) {
+      const profile = importContext.profile || importContext.job.profile;
+      if (readRoute()?.username?.toLowerCase() !== profile.username.toLowerCase()) {
         setMessage("Return to the original profile to import this report.", "error"); return;
       }
       const context = importContext;
@@ -714,6 +768,13 @@
       importAbortController = new AbortController();
       onBusyChange(); update();
       try {
+        if (context.kind === "downloads") {
+          const result = await request({ type: M + "BROWSER_IMPORT_COMMIT", previewId: context.previewId });
+          await closeImport();
+          setMessage(context.cancelRequested ? "Import canceled. Recorded history and video files were kept." : `History recorded: ${result.imported} imported, ${result.alreadyRecorded} already recorded, ${result.missing} missing, ${result.conflicts} need review. Videos stayed in place.`, "success");
+          onActivity?.(`browser-history-import-${context.previewId}`, `${result.imported} verified browser downloads added to profile history.`, "complete");
+          return;
+        }
         const result = await context.cache.importReport(context.preview, {
           signal: importAbortController.signal,
           onProgress: progress => {
@@ -725,8 +786,10 @@
         setMessage(`Import complete: ${result.imported} recorded, ${result.copied} copied. ${result.alreadyRecorded} already recorded, ${result.missing} missing, ${result.conflicts} need review.`);
         onActivity?.(`cache-import-${context.job.jobId}`, `${result.imported} verified videos added to profile history.`, "complete");
       } catch (cause) {
-        importCommit.textContent = "Retry import";
-        setMessage(cause.message || "The import stopped. You can retry or cancel; completed copies are kept.", "error");
+        if (!context.cancelRequested) {
+          importCommit.textContent = "Retry import";
+          setMessage(cause.message || "The import stopped. You can retry or cancel; completed copies are kept.", "error");
+        }
       } finally {
         importing = false;
         importAbortController = null;
@@ -735,9 +798,13 @@
     }
     async function cancelImport(event) {
       if (!event?.isTrusted || !importContext) return;
-      if (importing) { importAbortController?.abort(); return; }
+      if (importing) {
+        if (importContext.kind === "downloads") await cancelBrowserImport(importContext);
+        else importAbortController?.abort();
+        return;
+      }
       importing = true; onBusyChange(); update();
-      try { await closeImport(); setMessage("Import closed. Previously imported videos were kept."); }
+      try { await closeImport(); setMessage("Import closed. Recorded history and video files were kept."); }
       catch (cause) { setMessage(cause.message || "The import session could not be closed. Try Cancel again.", "error"); }
       finally { importing = false; onBusyChange(); update(); }
     }
@@ -840,6 +907,16 @@
 
     function contextChanged() {
       if (hasJob() && !sameProfile()) controller?.pause("Return to the original profile before resuming this batch.");
+      if (importContext?.kind === "downloads" && !importContext.navigationCanceled && !atClearProfile(importContext.profile)) {
+        importContext.navigationCanceled = true;
+        if (importing) cancelBrowserImport(importContext, "Browser history import canceled because the profile changed.");
+        else {
+          importing = true;
+          cancelBrowserImport(importContext, "Browser history import canceled because the profile changed.")
+            .finally(() => { importing = false; update(); onBusyChange(); });
+          onBusyChange();
+        }
+      }
       if (clearContext && !clearingHistory && !atClearProfile(clearContext.profile)) {
         const attempted = clearContext.attempted;
         closeClearContext();
@@ -863,7 +940,7 @@
     }
     update();
     return Object.freeze({ element: section, update, contextChanged, loadSettings, isBusy: busy,
-      hasNativeJob: () => (hasJob() && jobDestination?.kind === "folder") || (importing && !!importContext) || (clearingHistory && !!clearContext), snapshot: () => snapshot });
+      hasNativeJob: () => (hasJob() && jobDestination?.kind === "folder") || (importing && !!importContext && importContext.kind !== "downloads") || (clearingHistory && !!clearContext), snapshot: () => snapshot });
   }
 
   Object.defineProperty(globalThis, "ReelSaverBulkPanel", { value: Object.freeze({ create, buildReport }), configurable: true });

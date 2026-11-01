@@ -20,11 +20,12 @@ for (const candidate of candidates) {
 }
 if (!executable) throw new Error('Set REEL_SAVER_BROWSER to a Chromium executable.');
 const mainFixture = `(() => {
- const profile=location.pathname.startsWith('/second_creator/')?{id:'67890',username:'second_creator'}:{id:'12345',username:'example_creator'};
+ const profile=location.pathname.startsWith('/second_creator/')?{id:'67890',username:'second_creator'}:
+  {id:'12345',username:location.pathname.startsWith('/renamed_creator/')?'renamed_creator':'example_creator'};
  const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
  const code=id=>{let n=BigInt(id),s='';do{s=alphabet[Number(n%64n)]+s;n/=64n;}while(n);return s;};
  const ids=Array.from({length:profile.id==='12345'?36:2},(_,i)=>String(100001+i));
- const media=id=>({pk:id,code:code(id),media_type:2,user:{pk:profile.id,username:profile.username},
+ const media=id=>({pk:id,code:code(id),media_type:2,user:{pk:window.__pageFixture?.ownerId||profile.id,username:window.__pageFixture?.ownerUsername||profile.username},
   video_versions:[{url:'https://scontent.cdninstagram.com/'+code(id)+'.mp4?secret=local_fixture',width:32,height:32}]});
  const graphId='graphql-profile-'+profile.id,provider='__relay_internal__pv__PolarisShortDramaEnabledrelayprovider';
  window.__pageFixture={pages:[],counts:[],graphIds:[],info:[],providers:0,readerCalls:0};
@@ -47,10 +48,11 @@ const mainFixture = `(() => {
     const variables=operation.request.variables;
     if(variables.first!==12||variables.id!==graphId||variables.data.target_user_id!==profile.id)throw new Error('Profile query arguments were not supplied');
     window.__pageFixture.counts.push(variables.first);window.__pageFixture.graphIds.push(variables.id);
-    window.__pageFixture.pages.push(variables.after||null);const offset=Number(variables.after||0),values=ids.slice(offset,offset+12),after=offset+values.length;
+    const feed=window.__pageFixture.ids||ids;
+    window.__pageFixture.pages.push(variables.after||null);const offset=Number(variables.after||0),values=feed.slice(offset,offset+12),after=offset+values.length;
     const subscription={unsubscribe(){}};observer.start?.(subscription);
     observer.next({data:{fetch__XDTUserDict:{id:graphId,clips_connection:{edges:values.map(id=>({node:{media:media(id)}})),
-      page_info:{has_next_page:after<ids.length,end_cursor:after<ids.length?String(after):null}}}}});
+      page_info:{has_next_page:after<feed.length,end_cursor:after<feed.length?String(after):null}}}}});
     observer.complete();return subscription;}});
  const modules={PolarisRelayEnvironment:environment,
   'PolarisProfileReelsTabContentQuery_connection.graphql':descriptor,
@@ -454,6 +456,79 @@ try {
   assert.equal(await workerEval('globalThis.__browserHistoryFixture.at(-1).filename'),firstBrowserFiles[0]);
   assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),1);
   console.log('PASS browser history survives a new job/tab document and Chrome-reported missing files can download again');
+
+  // Exact numeric identity must survive a different media owner and boundary
+  // underscores. These records are kept in real extension local storage.
+  await evaluate("window.__pageFixture.ids=['127','4033'];window.__pageFixture.ownerId='456789';window.__pageFixture.ownerUsername='coauthor'");
+  await setLimit(2);
+  const beforeEdgeFiles=await workerEval('globalThis.__browserHistoryFixture.length');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'coauthored boundary-underscore Reel saves');
+  const edgeFiles=await workerEval('globalThis.__browserHistoryFixture.slice(-2).map(item=>item.filename)');
+  assert.deepEqual(edgeFiles.map(filename=>filename.split('/').pop()),['coauthor_B_.mp4','coauthor__B.mp4']);
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeEdgeFiles+2);
+  const receiptPrivacy=await workerEval(`(async()=>{const values=await chrome.storage.local.get(null),text=JSON.stringify(values);return{
+    edgeReceipts:Object.values(values).filter(value=>value?.profileId==='12345'&&['127','4033'].includes(value?.mediaId)).length,
+    hasUrls:text.includes('https:')||text.includes('http:'),hasAbsolutePaths:Object.values(values).some(value=>
+      value&&typeof value==='object'&&Object.values(value).some(field=>typeof field==='string'&&/^[A-Za-z]:/.test(field)))};})()`);
+  assert.equal(receiptPrivacy.edgeReceipts,2);
+  assert.equal(receiptPrivacy.hasUrls,false);
+  assert.equal(receiptPrivacy.hasAbsolutePaths,false);
+  const beforeEdgeLookup=await mediaInfoCount();
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Completed.') && Number(${query('[data-count=alreadyDownloaded]')}.textContent)===2 && !${query('[data-role=bulk-start]')}.disabled`,'receipt identity skips coauthor and underscores');
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),0);
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeEdgeFiles+2);
+  assert.equal(await mediaInfoCount(),beforeEdgeLookup,'receipt lookup needs no new Instagram media resolution');
+  console.log('PASS persistent receipts skip coauthored Reels with leading/trailing underscore codes and preserve exact filenames');
+
+  await page('Page.navigate',{url:'https://www.instagram.com/renamed_creator/reels/'});
+  await reconnectFixture('renamed profile document');
+  await selectDestination('downloads');
+  await evaluate("window.__pageFixture.ids=['127','4033'];window.__pageFixture.ownerId='456789';window.__pageFixture.ownerUsername='renamed_coauthor'");
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Completed.') && Number(${query('[data-count=alreadyDownloaded]')}.textContent)===2 && !${query('[data-role=bulk-start]')}.disabled`,'numeric profile and media receipt survives username changes');
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeEdgeFiles+2);
+  assert.equal(await mediaInfoCount(),0);
+  console.log('PASS renamed profile/coauthor reuse numeric-identity receipts after a new document');
+
+  await workerEval('globalThis.__browserHistoryFixture.find(item=>item.filename.endsWith("coauthor_B_.mp4")).exists=false');
+  await setLimit(1);
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'missing receipted file remains eligible');
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeEdgeFiles+3);
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.at(-1).filename.split("/").pop()'),'renamed_coauthor_B_.mp4');
+  console.log('PASS a missing receipted MP4 downloads once and replaces its receipt under the same stable IDs');
+
+  // An explicit old report establishes identities that legacy filename
+  // sanitization erased. Preview must not persist a receipt or create files.
+  await workerEval(`(() => {const records=globalThis.__browserHistoryFixture;records.push({id:records.length+1000,
+    byExtensionId:chrome.runtime.id,filename:'C:/Fixture Downloads/Reel Saver/legacy_owner_D.mp4',
+    url:'https://scontent.cdninstagram.com/D_.mp4',state:'complete',mime:'video/mp4',exists:true,
+    fileSize:2048,totalBytes:2048,bytesReceived:2048,startTime:new Date().toISOString()});})()`);
+  const legacyReportPath=path.join(profile,'browser-legacy-report.json');
+  await writeFile(legacyReportPath,JSON.stringify({version:1,profile:{id:'12345',username:'previous_creator'},
+    items:[{mediaId:'255',shortcode:'D_',state:'saved',filename:'legacy_owner_D.mp4',bytesWritten:2048}]}));
+  await page('DOM.enable');
+  const reportInput=await page('Runtime.evaluate',{expression:query('[data-role=cache-import-file]')});
+  await page('DOM.setFileInputFiles',{objectId:reportInput.result.objectId,files:[legacyReportPath]});
+  await waitFor(`!${query('[data-role=cache-import-summary]')}.hidden && !${query('[data-role=cache-import-commit]')}.disabled`,'real worker verifies ambiguous legacy report');
+  assert.match(await evaluate(`${query('[data-role=cache-import-summary]')}.textContent`),/1 verified and ready/);
+  const legacyReceiptCount=()=>workerEval("chrome.storage.local.get(null).then(values=>Object.values(values).filter(value=>value?.profileId==='12345'&&value?.mediaId==='255').length)");
+  assert.equal(await legacyReceiptCount(),0,'browser report preview is read-only');
+  const beforeLegacyFiles=await workerEval('globalThis.__browserHistoryFixture.length');
+  await click(query('[data-role=cache-import-commit]'));
+  await waitFor(`${query('[data-role=cache-import-summary]')}.hidden && !${query('[data-role=bulk-start]')}.disabled`,'browser import confirms and releases ownership');
+  assert.equal(await legacyReceiptCount(),1);
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeLegacyFiles,'import never downloads or copies a video');
+  await evaluate("window.__pageFixture.ids=['255']");
+  const beforeLegacyLookup=await mediaInfoCount();
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Completed.') && Number(${query('[data-count=alreadyDownloaded]')}.textContent)===1 && !${query('[data-role=bulk-start]')}.disabled`,'imported report identity skips the legacy trimmed filename');
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),0);
+  assert.equal(await mediaInfoCount(),beforeLegacyLookup);
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeLegacyFiles);
+  console.log('PASS installed browser report preview/confirmation recovers old coauthor/underscore identity without a video download');
   const artifacts=path.join(root,'artifacts');await mkdir(artifacts,{recursive:true});
   const capture=await page('Page.captureScreenshot',{format:'png'});
   await writeFile(path.join(artifacts,'bulk-extension-preview.png'),Buffer.from(capture.data,'base64'));

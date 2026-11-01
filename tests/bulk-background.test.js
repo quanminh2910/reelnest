@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { receiptKey } from "../src/background/browser-receipts.js";
 
 const extensionId = "bulk-test-extension";
 const profile = { id: "900", username: "creator" };
@@ -36,6 +37,14 @@ function fixture() {
         state.failSessionWrite = false;
         throw new Error("Storage unavailable");
       }
+      if (state.failLocalWrite && name === "local") {
+        state.failLocalWrite = false;
+        throw new Error("Local storage unavailable");
+      }
+      if (name === "local" && state.localWriteGate && Object.keys(values).some(key => key.startsWith("reelnest:browser-receipt:v1:"))) {
+        state.localWriting?.resolve();
+        await state.localWriteGate.promise;
+      }
       state[name] = { ...state[name], ...structuredClone(values) };
     },
     async remove(keys) {
@@ -69,7 +78,7 @@ function fixture() {
       if (state.resolveGate) await state.resolveGate.promise;
       return [{ frameId: 0, result: { ok: true, profile, media: {
         mediaId: mediaItem.mediaId, shortcode: mediaItem.shortcode,
-        pageUrl: `https://www.instagram.com/reel/${mediaItem.shortcode}/`, username: "creator",
+        pageUrl: `https://www.instagram.com/reel/${mediaItem.shortcode}/`, username: state.mediaUsername || "creator",
         url: state.videoUrl || "https://scontent.cdninstagram.com/video/reel.mp4?local=fixture",
         width: 720, height: 1280,
       } } }];
@@ -80,7 +89,7 @@ function fixture() {
         if (state.downloadError) throw new Error("Chrome rejected download");
         const id = state.downloads.length + 1;
         state.downloads.push({ id, byExtensionId: extensionId, filename: options.filename,
-          url: options.url, state: "in_progress", startTime: new Date().toISOString(), exists: true, mime: "video/mp4" });
+          url: options.url, state: state.completeDownload ? "complete" : "in_progress", startTime: new Date().toISOString(), exists: true, mime: "video/mp4", fileSize: 2048 });
         if (state.failAcceptanceRecord) {
           state.failAcceptanceRecord = false;
           state.failSessionWrite = true;
@@ -90,7 +99,14 @@ function fixture() {
       },
       async search(query) {
         state.calls.push({ type: "search", query });
-        return structuredClone(query.id == null ? state.downloads : state.downloads.filter(value => value.id === query.id));
+        if (state.search) return state.search(query);
+        const matches = state.downloads.filter(value =>
+          (query.id == null || value.id === query.id) &&
+          (!query.state || value.state === query.state) &&
+          (query.exists === undefined || value.exists === query.exists) &&
+          (!query.filenameRegex || new RegExp(query.filenameRegex).test(value.filename)));
+        if (query.orderBy?.includes("-startTime")) matches.sort((a, b) => b.startTime.localeCompare(a.startTime));
+        return structuredClone(matches.slice(0, query.limit || matches.length));
       },
       async cancel(id) {
         state.calls.push({ type: "cancel", id });
@@ -142,6 +158,180 @@ test("bulk settings default to 35 and validate mode and bounded integer size", a
   }
   assert.equal((await api.handleBulkMessage(message("SETTINGS_SET", { settings: { mode: "unknown", batchSize: 35 } }), sender())).ok, false);
   assert.equal(f.state.local["reel-saver:bulk-prefs"].batchSize, 50);
+});
+
+function historyRecord(overrides = {}) {
+  return { id: 500, byExtensionId: extensionId, filename: "C:\\Downloads\\Reel Saver\\creator_B.mp4",
+    url: "https://scontent.cdninstagram.com/video/reel.mp4?fixture=history", state: "complete", exists: true,
+    mime: "video/mp4", fileSize: 2048, startTime: "2026-01-01T00:00:00.000Z", ...overrides };
+}
+const existing = (api, job, entry = item, source = sender()) =>
+  api.handleBulkMessage(message("CHECK_EXISTING", { jobId: job.jobId, item: entry }), source);
+
+test("browser history recognizes earlier owned MP4s, Windows paths, and unique-copy suffixes without consuming allowance", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  for (const filename of ["C:\\Downloads\\Reel Saver\\creator_B.mp4", "C:/Downloads/Reel Saver/CREATOR_B (1).mp4"]) {
+    f.state.downloads = [historyRecord({ filename })];
+    const response = await existing(api, job);
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.result, { cacheHit: true, filename: filename.split(/[\\/]/).pop(), bytesWritten: 2048,
+      downloadId: 500, verification: "browser_history" });
+  }
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal(f.state.sourceCalls.filter(request => request.action === "resolve").length, 0);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 0);
+});
+
+test("browser history rejects incomplete, missing, foreign, ambiguous, and invalid MP4 records", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api);
+  await discover(api, job);
+  for (const change of [
+    { byExtensionId: "another-extension" }, { state: "interrupted" }, { exists: false },
+    { fileSize: 0 }, { fileSize: -1 }, { fileSize: undefined }, { mime: "text/html" }, { mime: "" },
+    { url: "https://cdninstagram.com.attacker.example/reel.mp4" },
+    { finalUrl: "https://attacker.example/reel.mp4" },
+    { filename: "C:/Downloads/creator_b.mp4" }, { filename: "C:/Downloads/other_B.mp4" },
+    { filename: "C:/Downloads/creator_AB.mp4" }, { filename: "C:/Downloads/creator_B.mp4.html" },
+  ]) {
+    f.state.downloads = [historyRecord(change)];
+    assert.equal((await existing(api, job)).result, null, JSON.stringify(change));
+  }
+  // Current legacy filename sanitization drops a trailing underscore. It must
+  // not be guessed as the already-downloaded identity of this distinct Reel.
+  const ambiguous = { mediaId: "127", shortcode: "B_" };
+  f.state.session[memberKey(job.jobId, ambiguous.mediaId)] = ambiguous;
+  f.state.downloads = [historyRecord()];
+  assert.equal((await existing(api, job, ambiguous)).result, null);
+});
+
+test("browser history lookup is limited to discovered members and rejects navigation after its asynchronous query", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api);
+  await discover(api, job);
+  assert.equal((await existing(api, job, thirdItem)).error.code, "INVALID_ITEM");
+  assert.equal((await existing(api, job, item, sender(8))).error.code, "STALE_JOB");
+  const querying = deferred(); const finishQuery = deferred();
+  f.state.search = async () => { querying.resolve(); await finishQuery.promise; return [historyRecord()]; };
+  const pendingResult = existing(api, job);
+  await querying.promise;
+  f.state.tabs.get(7).url = "https://www.instagram.com/another_creator/reels/";
+  finishQuery.resolve();
+  assert.equal((await pendingResult).error.code, "PAGE_CHANGED");
+});
+
+test("history query failures and bounded-result overflow pause rather than silently downloading duplicates", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api);
+  await discover(api, job);
+  f.state.search = async () => { throw new Error("Chrome history unavailable"); };
+  assert.equal((await existing(api, job)).error.code, "CACHE_HISTORY_UNAVAILABLE");
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job), sender())).error.code, "CACHE_HISTORY_UNAVAILABLE");
+  f.state.search = async () => Array.from({ length: 201 }, (_, index) => historyRecord({ id: index }));
+  assert.equal((await existing(api, job)).error.code, "CACHE_HISTORY_LIMIT");
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 0);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+});
+
+test("DOWNLOAD rechecks prior browser history before resolving media or reserving a save", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  assert.equal((await existing(api, job)).result, null);
+  f.state.downloads = [historyRecord()];
+  const response = await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  assert.equal(response.alreadySaved, true);
+  assert.equal(response.result.cacheHit, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal(f.state.sourceCalls.filter(request => request.action === "resolve").length, 0);
+});
+
+test("skip-off runs deliberately create another browser copy while invalid skip preferences are rejected", async () => {
+  const f = fixture(); const api = await load(f);
+  for (const skipExisting of [null, "false", 1]) {
+    assert.equal((await api.handleBulkMessage(message("START", { options: { ...options(), skipExisting } }), sender())).error.code, "INVALID_SETTINGS");
+  }
+  const started = await api.handleBulkMessage(message("START", { options: { ...options(), skipExisting: false } }), sender());
+  const job = started.job;
+  await discover(api, job);
+  f.state.downloads = [historyRecord()];
+  assert.equal((await existing(api, job)).result, null);
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job), sender())).ok, true);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+});
+
+test("a lost completion response remains a new save in its own run across worker restart", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  f.state.downloads[0].state = "complete"; f.state.downloads[0].fileSize = 2048;
+  api = await load(f);
+  assert.equal((await existing(api, job)).result, null, "own-operation receipt cannot become an older history hit");
+  const response = await api.handleBulkMessage(operation("DOWNLOAD", job, "retry"), sender());
+  assert.equal(response.download.state, "complete");
+  assert.equal(response.alreadySaved, undefined);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+});
+
+test("an own-run resolving reservation is not stranded by a matching older history record after restart", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  // Recreate the journal boundary of a worker terminated after reserving a
+  // lookup, before Chrome accepted a file. An earlier copy appears meanwhile.
+  f.state.session[activeKey].reservationMediaId = item.mediaId;
+  f.state.session[operationKey(job.jobId)] = { jobId: job.jobId, ...item, attemptId: "old-attempt",
+    state: "resolving", quotaState: "reserved", startedAt: Date.now(), destination: "downloads" };
+  f.state.downloads = [historyRecord()];
+  api = await load(f);
+  const response = await api.handleBulkMessage(operation("DOWNLOAD", job, "retry"), sender());
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.alreadySaved, undefined);
+  assert.equal(response.download.state, "in_progress");
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+  f.state.downloads.at(-1).state = "complete"; f.state.downloads.at(-1).fileSize = 2048;
+  await api.handleBulkMessage(operation("STATUS", job, "retry"), sender());
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+});
+
+test("a 25-save browser run followed by a limit of 10 skips the first 25 across worker restart", async () => {
+  const f = fixture(); let api = await load(f);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const code = value => { let n = BigInt(value), result = ""; do { result = alphabet[Number(n % 64n)] + result; n /= 64n; } while (n); return result; };
+  const entries = Array.from({ length: 36 }, (_, index) => ({ mediaId: String(100001 + index), shortcode: code(100001 + index) }));
+  const job = await start(api, sender(), "downloads", 25);
+  const register = async current => {
+    f.state.source = () => ({ ok: true, profile, page: { items: entries, nextCursor: null, hasMore: false } });
+    assert.equal((await discover(api, current)).ok, true);
+    delete f.state.source;
+  };
+  await register(job);
+  for (const entry of entries.slice(0, 25)) {
+    const response = await api.handleBulkMessage(operation("DOWNLOAD", job, `first-${entry.mediaId}`, { item: entry }), sender());
+    assert.equal(response.ok, true, JSON.stringify(response));
+    const download = f.state.downloads.at(-1); download.state = "complete"; download.fileSize = 2048;
+    assert.equal((await api.handleBulkMessage(operation("STATUS", job, `first-${entry.mediaId}`, { item: entry }), sender())).ok, true);
+  }
+  assert.equal(f.state.session[activeKey].committedNewSaves, 25);
+  assert.equal((await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "completed" }), sender())).ok, true);
+  api = await load(f);
+  const nextJob = await start(api, sender(), "downloads", 10);
+  await register(nextJob);
+  let hits = 0;
+  for (const entry of entries.slice(0, 35)) {
+    const cached = await existing(api, nextJob, entry);
+    if (cached.result) { hits++; continue; }
+    const attemptId = `next-${entry.mediaId}`;
+    const response = await api.handleBulkMessage(operation("DOWNLOAD", nextJob, attemptId, { item: entry }), sender());
+    assert.equal(response.ok, true, JSON.stringify(response));
+    const download = f.state.downloads.at(-1); download.state = "complete"; download.fileSize = 2048;
+    await api.handleBulkMessage(operation("STATUS", nextJob, attemptId, { item: entry }), sender());
+  }
+  assert.equal(hits, 25);
+  assert.equal(f.state.downloads.length, 35);
+  assert.equal(new Set(f.state.downloads.map(download => download.filename)).size, 35);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 10);
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", nextJob, "over-limit", { item: entries[35] }), sender())).error.code, "PROFILE_LIMIT_REACHED");
 });
 
 test("profile identification is read-only and does not acquire or replace a batch owner", async () => {
@@ -907,4 +1097,295 @@ test("a no-output acknowledgement before registration fences a delayed resolve a
     assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "new-attempt"), sender())).ok, true,
       "a different attempt can use the unconsumed allowance");
   }
+});
+
+test("durable receipts recognize a coauthored underscore Reel after worker restart and profile rename", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  const special = { mediaId: "127", shortcode: "B_" };
+  await discover(api, job);
+  f.state.session[memberKey(job.jobId, special.mediaId)] = special;
+  f.state.mediaUsername = "coauthor";
+  const first = await api.handleBulkMessage(operation("DOWNLOAD", job, "special", { item: special }), sender());
+  assert.equal(first.ok, true, JSON.stringify(first));
+  f.state.downloads[0].state = "complete";
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job, "special", { item: special }), sender())).ok, true);
+  const receipt = f.state.local[receiptKey(profile.id, special)];
+  assert.equal(receipt.profileId, profile.id);
+  assert.equal(receipt.mediaId, special.mediaId);
+  assert.equal(receipt.shortcode, "B_");
+  assert.equal(receipt.filename, "coauthor_B_.mp4");
+  assert.equal(JSON.stringify(receipt).includes("https:"), false);
+  assert.equal(JSON.stringify(receipt).includes("C:"), false);
+  assert.equal((await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "completed" }), sender())).ok, true);
+  const renamedProfile = { ...profile, username: "renamed_creator" };
+  const renamedUrl = "https://www.instagram.com/renamed_creator/reels/";
+  f.state.tabs.get(7).url = renamedUrl;
+  const renamedSender = { ...sender(), url: renamedUrl, tab: { id: 7, url: renamedUrl } };
+  f.state.source = request => request.action === "identify" ? { ok: true, profile: renamedProfile }
+    : { ok: true, profile: renamedProfile, page: { items: [special], nextCursor: null, hasMore: false } };
+  api = await load(f);
+  const next = await start(api, renamedSender, "downloads", 1);
+  await discover(api, next, renamedSender);
+  const cached = await existing(api, next, special, renamedSender);
+  assert.equal(cached.result.verification, "browser_receipt");
+  assert.equal(cached.result.filename, "coauthor_B_.mp4");
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", next, "new", { item: special }), renamedSender)).alreadySaved, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+});
+
+test("receipt persistence failures hold allowance and replay metadata without another Chrome transfer", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  f.state.downloads[0].state = "complete";
+  f.state.failLocalWrite = true;
+  const failed = await api.handleBulkMessage(operation("STATUS", job), sender());
+  assert.equal(failed.error.code, "CACHE_RECEIPT_WRITE_FAILED");
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.session[activeKey].reservationMediaId, item.mediaId);
+  assert.equal(f.state.local[receiptKey(profile.id, item)], undefined);
+  api = await load(f);
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.ok(f.state.local[receiptKey(profile.id, item)]);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+});
+
+test("an immediately completed download journals its accepted ID before a receipt failure despite a rapid older copy", async () => {
+  const f = fixture(); let api = await load(f);
+  const job = (await api.handleBulkMessage(message("START", { options: { ...options(), maxNewVideos: 1, skipExisting: false } }), sender())).job;
+  await discover(api, job);
+  f.state.downloads = [historyRecord({ filename: "Reel Saver/creator_B.mp4", startTime: new Date().toISOString() })];
+  f.state.completeDownload = true;
+  f.state.failLocalWrite = true;
+  const failed = await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  assert.equal(failed.error.code, "CACHE_RECEIPT_WRITE_FAILED");
+  assert.equal(f.state.session[operationKey(job.jobId)].downloadId, 2);
+  assert.equal(f.state.session[activeKey].reservationMediaId, item.mediaId);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  api = await load(f);
+  const retried = await api.handleBulkMessage(operation("DOWNLOAD", job, "retry"), sender());
+  assert.equal(retried.ok, true, JSON.stringify(retried));
+  assert.equal(retried.download.id, 2);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.local[receiptKey(profile.id, item)].downloadId, 2);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+});
+
+test("a delayed old-job status cannot overwrite the newer run's durable receipt", async () => {
+  const f = fixture(); const api = await load(f); const first = await start(api, sender(), "downloads", 1);
+  await discover(api, first);
+  await api.handleBulkMessage(operation("DOWNLOAD", first), sender());
+  f.state.downloads[0].state = "complete";
+  await api.handleBulkMessage(operation("STATUS", first), sender());
+  await api.handleBulkMessage(message("END", { jobId: first.jobId, state: "completed" }), sender());
+  const querying = deferred(), finishQuery = deferred();
+  let oldReads = 0;
+  f.state.search = async query => {
+    const result = structuredClone(f.state.downloads.filter(value => query.id == null || value.id === query.id));
+    if (query.id === 1 && ++oldReads === 2) { querying.resolve(); await finishQuery.promise; }
+    return result;
+  };
+  const oldStatus = api.handleBulkMessage(operation("STATUS", first), sender());
+  await querying.promise;
+  const next = (await api.handleBulkMessage(message("START", { options: { ...options(), skipExisting: false } }), sender())).job;
+  await discover(api, next);
+  await api.handleBulkMessage(operation("DOWNLOAD", next, "new"), sender());
+  f.state.downloads[1].state = "complete";
+  await api.handleBulkMessage(operation("STATUS", next, "new"), sender());
+  assert.equal(f.state.local[receiptKey(profile.id, item)].downloadId, 2);
+  finishQuery.resolve();
+  assert.equal((await oldStatus).error.code, "STALE_JOB");
+  assert.equal(f.state.local[receiptKey(profile.id, item)].downloadId, 2);
+});
+
+test("unknown completed size remains reserved until Chrome confirms metadata, without a new download", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  f.state.downloads[0].state = "complete";
+  f.state.downloads[0].fileSize = -1;
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).error.code, "CACHE_RECEIPT_UNVERIFIED");
+  assert.equal(f.state.session[activeKey].reservationMediaId, item.mediaId);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  f.state.downloads[0].fileSize = 2048;
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.downloads.length, 1);
+});
+
+test("corrupt durable receipts pause before discovery fallback or another file can start", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api);
+  await discover(api, job);
+  f.state.local[receiptKey(profile.id, item)] = { schemaVersion: 2 };
+  assert.equal((await existing(api, job)).error.code, "CACHE_RECEIPT_UNSUPPORTED");
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job), sender())).error.code, "CACHE_RECEIPT_UNSUPPORTED");
+  assert.equal(f.state.downloads.length, 0);
+});
+
+function oldBrowserReport(items = [{ ...item, state: "saved", filename: "coauthor_B.mp4", bytesWritten: 2048 }]) {
+  return { version: 1, profile: { ...profile }, items };
+}
+
+test("browser report preview is read-only, owns the global slot, and confirmed migration binds exact report identities", async () => {
+  const f = fixture(); let api = await load(f);
+  const special = { mediaId: "127", shortcode: "B_" };
+  // The old release trimmed B_ to B; only this selected report binds that
+  // ambiguous filename to the numeric Reel identity.
+  f.state.downloads = [historyRecord({ filename: "C:/Downloads/coauthor_B.mp4" })];
+  const report = oldBrowserReport([{ ...special, state: "saved", filename: "coauthor_B.mp4", bytesWritten: 2048 }]);
+  const preview = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report }), sender());
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.deepEqual(preview.summary, { saved: 1, ready: 1, alreadyRecorded: 0, missing: 0, conflicts: 0, ignored: 0 });
+  assert.deepEqual(f.state.local, {}, "preview does not persist receipts");
+  assert.equal((await api.handleBulkMessage(message("START", { options: options() }), sender(8))).error.code, "BULK_BUSY");
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender(8))).error.code, "STALE_JOB");
+  const committed = await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender());
+  assert.equal(committed.imported, 1);
+  assert.equal(f.state.local[receiptKey(profile.id, special)].downloadId, 500);
+  assert.equal(f.state.session[activeKey].active, true, "the UI explicitly closes its import session");
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: preview.previewId }), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].active, false);
+  api = await load(f);
+  const job = await start(api);
+  await discover(api, job);
+  f.state.session[memberKey(job.jobId, special.mediaId)] = special;
+  assert.equal((await existing(api, job, special)).result.verification, "browser_receipt");
+  assert.equal(f.state.calls.some(call => call.type === "download"), false);
+});
+
+test("browser report confirmation rechecks files and can retry a failed receipt write without importing another copy", async () => {
+  const f = fixture(); const api = await load(f);
+  f.state.downloads = [historyRecord({ filename: "C:/Downloads/coauthor_B.mp4" })];
+  const first = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: oldBrowserReport() }), sender());
+  f.state.downloads[0].exists = false;
+  const missing = await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: first.previewId }), sender());
+  assert.equal(missing.missing, 1);
+  assert.deepEqual(f.state.local, {});
+  await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: first.previewId }), sender());
+  f.state.downloads[0].exists = true;
+  const next = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: oldBrowserReport() }), sender());
+  f.state.failLocalWrite = true;
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: next.previewId }), sender())).error.code, "CACHE_RECEIPT_WRITE_FAILED");
+  assert.equal(f.state.session[activeKey].active, true);
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: next.previewId }), sender())).imported, 1);
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: next.previewId }), sender())).alreadyRecorded, 1);
+  assert.equal(f.state.calls.some(call => call.type === "download"), false);
+  await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: next.previewId }), sender());
+  const recorded = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: oldBrowserReport() }), sender());
+  assert.equal(recorded.summary.ready, 0);
+  assert.equal(recorded.summary.alreadyRecorded, 1);
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: recorded.previewId }), sender())).alreadyRecorded, 1);
+});
+
+test("browser import cancellation releases its same-document owner after navigation and invalid report profiles preserve history", async () => {
+  const f = fixture(); const api = await load(f);
+  f.state.downloads = [historyRecord({ filename: "C:/Downloads/coauthor_B.mp4" })];
+  const bad = { ...oldBrowserReport(), profile: { id: "901", username: "someone_else" } };
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: bad }), sender())).error.code, "CACHE_RECEIPT_REPORT_INVALID");
+  assert.equal(f.state.session[activeKey].active, false);
+  assert.deepEqual(f.state.local, {});
+  const preview = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: oldBrowserReport() }), sender());
+  f.state.tabs.get(7).url = "https://www.instagram.com/another_creator/reels/";
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender())).error.code, "PAGE_CHANGED");
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL"), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].active, false);
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: preview.previewId }), sender())).ok, true);
+});
+
+test("browser import confirmation rejects a changed numeric profile even at the same username URL", async () => {
+  const f = fixture(); const api = await load(f);
+  f.state.downloads = [historyRecord({ filename: "C:/Downloads/coauthor_B.mp4" })];
+  const preview = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: oldBrowserReport() }), sender());
+  f.state.source = () => ({ ok: true, profile: { ...profile, id: "901" } });
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender())).error.code, "CACHE_RECEIPT_PROFILE_CHANGED");
+  assert.deepEqual(f.state.local, {});
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: preview.previewId }), sender())).ok, true);
+});
+
+test("Cancel during browser receipt import stops later rows and holds global ownership until the active write settles", async () => {
+  const f = fixture(); const api = await load(f);
+  f.state.downloads = [historyRecord({ filename: "C:/Downloads/coauthor_B.mp4" }),
+    historyRecord({ id: 501, filename: "C:/Downloads/coauthor_C.mp4" })];
+  const report = oldBrowserReport([item, secondItem].map(entry => ({ ...entry, state: "saved", filename: `coauthor_${entry.shortcode}.mp4`, bytesWritten: 2048 })));
+  const preview = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report }), sender());
+  const writing = deferred(), finishWrite = deferred();
+  f.state.localWriting = writing;
+  f.state.localWriteGate = finishWrite;
+  const committing = api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender());
+  await writing.promise;
+  let canceled = false;
+  const canceling = api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: preview.previewId }), sender()).then(result => { canceled = true; return result; });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(canceled, false);
+  assert.equal(f.state.session[activeKey].active, true);
+  let started = false;
+  const starting = api.handleBulkMessage(message("START", { options: options() }), sender(8)).then(result => { started = true; return result; });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(started, false);
+  finishWrite.resolve();
+  const completed = await committing;
+  assert.equal(completed.imported, 1);
+  assert.equal(completed.canceled, true);
+  assert.equal((await canceling).ok, true);
+  assert.equal((await starting).ok, true);
+  assert.ok(f.state.local[receiptKey(profile.id, item)]);
+  assert.equal(f.state.local[receiptKey(profile.id, secondItem)], undefined);
+});
+
+test("Cancel before a browser preview response releases its owner and fences the late read-only result", async () => {
+  const f = fixture(); const api = await load(f);
+  const searching = deferred(), finishSearch = deferred();
+  f.state.search = async query => { searching.resolve(); await finishSearch.promise; return [historyRecord({ filename: "C:/Downloads/coauthor_B.mp4" })]; };
+  const preparing = api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report: oldBrowserReport() }), sender());
+  await searching.promise;
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL"), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].active, false);
+  finishSearch.resolve();
+  assert.equal((await preparing).error.code, "SAVE_CANCELLED");
+  assert.deepEqual(f.state.local, {});
+  assert.equal(f.state.session[activeKey].active, false);
+});
+
+test("an imported trimmed underscore filename cannot become a history hit for a different Reel", async () => {
+  const f = fixture(); const api = await load(f);
+  const underscored = { mediaId: "4033", shortcode: "_B" };
+  f.state.downloads = [historyRecord()];
+  const report = oldBrowserReport([{ ...underscored, state: "saved", filename: "creator_B.mp4", bytesWritten: 2048 }]);
+  const preview = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report }), sender());
+  assert.equal((await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender())).imported, 1);
+  await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: preview.previewId }), sender());
+  const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  assert.equal((await existing(api, job)).result, null, "creator_B belongs to _B according to the selected report");
+  const response = await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  assert.equal(response.ok, true, JSON.stringify(response));
+  assert.equal(response.alreadySaved, undefined);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+  f.state.downloads.at(-1).state = "complete";
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.local[receiptKey(profile.id, underscored)].downloadId, 500);
+  assert.notEqual(f.state.local[receiptKey(profile.id, item)].downloadId, 500);
+});
+
+test("legacy lookup skips a conflicting claimed download and can adopt a later matching unclaimed copy", async () => {
+  const f = fixture(); const api = await load(f);
+  const underscored = { mediaId: "4033", shortcode: "_B" };
+  f.state.downloads = [historyRecord()];
+  const report = oldBrowserReport([{ ...underscored, state: "saved", filename: "creator_B.mp4", bytesWritten: 2048 }]);
+  const preview = await api.handleBulkMessage(message("BROWSER_IMPORT_PREVIEW", { report }), sender());
+  await api.handleBulkMessage(message("BROWSER_IMPORT_COMMIT", { previewId: preview.previewId }), sender());
+  await api.handleBulkMessage(message("BROWSER_IMPORT_CANCEL", { previewId: preview.previewId }), sender());
+  f.state.downloads.push(historyRecord({ id: 501, filename: "C:/Downloads/creator_B (1).mp4", startTime: "2025-01-01T00:00:00.000Z" }));
+  const job = await start(api);
+  await discover(api, job);
+  const hit = await existing(api, job);
+  assert.equal(hit.ok, true, JSON.stringify(hit));
+  assert.equal(hit.result.downloadId, 501);
+  assert.equal(f.state.local[receiptKey(profile.id, item)].downloadId, 501);
+  assert.equal(f.state.local[receiptKey(profile.id, underscored)].downloadId, 500);
+  assert.equal(f.state.calls.some(call => call.type === "download"), false);
 });

@@ -83,8 +83,12 @@ export function sanitizeFilenamePart(value) {
 
 export function buildFilename(media) {
   const author = sanitizeFilenamePart(media.username);
-  const shortcode = sanitizeFilenamePart(media.shortcode);
-  if (!shortcode) throw new ReelError("INVALID_REEL", "The Reel address is invalid.");
+  // A shortcode is an identifier. Its underscores and letter case must survive
+  // unchanged, including underscores at either end.
+  const shortcode = media.shortcode;
+  if (typeof shortcode !== "string" || !/^[A-Za-z0-9_-]{1,28}$/.test(shortcode)) {
+    throw new ReelError("INVALID_REEL", "The Reel address is invalid.");
+  }
   return `Reel Saver/${author ? `${author}_` : "reel_"}${shortcode}.mp4`;
 }
 
