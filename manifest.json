@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
   "name": "ReelNest",
-  "version": "0.4.2",
-  "description": "Save Instagram Reels to profile libraries with download history, duplicate skipping, and pause/resume.",
+  "version": "0.5.0",
+  "description": "Save Instagram Reels to profile libraries with download limits, history, duplicate skipping, and pause/resume.",
   "minimum_chrome_version": "111",
   "permissions": ["activeTab", "scripting", "downloads", "storage"],
   "host_permissions": ["https://www.instagram.com/*", "https://instagram.com/*"],
   "content_scripts": [{
     "matches": ["https://www.instagram.com/*", "https://instagram.com/*"],
-    "js": ["src/content/folder-writer.js", "src/content/profile-cache.js", "src/content/bulk-queue.js", "src/content/bulk-panel.js", "src/content/profile-panel.js"],
+    "js": ["src/shared/download-limits.js", "src/content/folder-writer.js", "src/content/profile-cache.js", "src/content/bulk-queue.js", "src/content/bulk-panel.js", "src/content/profile-panel.js"],
     "run_at": "document_idle",
     "all_frames": false
   }],

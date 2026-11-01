@@ -4,10 +4,43 @@ import { test } from "node:test";
 import vm from "node:vm";
 
 const context = vm.createContext({});
+vm.runInContext(await readFile(new URL("../src/shared/download-limits.js", import.meta.url), "utf8"), context);
 for (const filename of ["bulk-queue.js", "bulk-panel.js"]) {
   vm.runInContext(await readFile(new URL(`../src/content/${filename}`, import.meta.url), "utf8"), context);
 }
 const plain = value => JSON.parse(JSON.stringify(value));
+
+test("limited reports preserve the cap, confirmed saves, deferred items, and actual source exhaustion", () => {
+  const report = plain(context.ReelSaverBulkPanel.buildReport({
+    jobId: "job-limit", profile: { id: "123", username: "creator" }, mode: "batches", batchSize: 35,
+    maxNewVideos: 1, committedNewSaves: 1, completionReason: "profile_limit_reached",
+    state: "completed", phase: "downloading", sourceExhausted: false, startedAt: 1,
+    counts: { discovered: 2, saved: 1, failed: 0, deferred: 1 },
+    items: [{ mediaId: "1", shortcode: "B", state: "saved", attempts: 1, filename: "creator_B.mp4", bytesWritten: 24 },
+      { mediaId: "2", shortcode: "C", state: "deferred", attempts: 0, reason: "profile_limit_reached" }],
+  }));
+  assert.equal(report.version, 1);
+  assert.equal(report.maxNewVideos, 1);
+  assert.equal(report.committedNewSaves, 1);
+  assert.equal(report.completionReason, "profile_limit_reached");
+  assert.equal(report.sourceExhausted, false);
+  assert.equal(report.counts.deferred, 1);
+  assert.equal(report.items[1].state, "deferred");
+  assert.equal(report.items[1].reason, "profile_limit_reached");
+  assert.equal(report.items[0].filename, "creator_B.mp4");
+  assert.equal(report.items[0].bytesWritten, 24, "saved entries retain the importer's version-1 fields");
+});
+
+test("legacy snapshots export unlimited reports without inventing a completion reason", () => {
+  const report = plain(context.ReelSaverBulkPanel.buildReport({
+    jobId: "job-legacy", profile: { id: "123", username: "creator" }, mode: "batches", batchSize: 35,
+    state: "stopped", phase: "downloading", sourceExhausted: false, startedAt: 1,
+    counts: { discovered: 0, saved: 0 }, items: [],
+  }));
+  assert.equal(report.maxNewVideos, null);
+  assert.equal(report.committedNewSaves, 0);
+  assert.equal(Object.hasOwn(report, "completionReason"), false);
+});
 
 test("reports preserve top-level and per-item diagnostics while omitting credentials and full paths", () => {
   const diagnostic = {

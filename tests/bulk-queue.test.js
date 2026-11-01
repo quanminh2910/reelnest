@@ -4,10 +4,11 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../src/content/bulk-queue.js', import.meta.url), 'utf8');
+const limitSource = await readFile(new URL('../src/shared/download-limits.js', import.meta.url), 'utf8');
 const profile = { id: '1234', username: 'example_creator' };
 const item = value => ({ mediaId: String(value), shortcode: `R${value}`, username: profile.username });
 const result = entry => ({ filename: `creator_${entry.shortcode}.mp4`, bytesWritten: 50 });
-const options = overrides => ({ profile, batchSize: 35, mode: 'batches', ...overrides });
+const options = overrides => ({ profile, batchSize: 35, mode: 'batches', maxNewVideos: null, ...overrides });
 const plain = value => JSON.parse(JSON.stringify(value));
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -20,6 +21,7 @@ function deferred() {
 
 function load(deps = {}) {
   const context = vm.createContext({ AbortController, setTimeout, clearTimeout });
+  vm.runInContext(limitSource, context);
   vm.runInContext(source, context);
   return { api: context.ReelSaverBulkQueue,
     queue: context.ReelSaverBulkQueue.create({ retryDelays: [],
@@ -47,6 +49,290 @@ test('validates identifiers, download mode, and bounded batch size before starti
     options({ profile: { id: '12', username: '../creator' } }),
   ]) assert.throws(() => queue.start(invalid), { code: 'INVALID_OPTIONS' });
   assert.equal(queue.snapshot().state, 'idle');
+});
+
+test('validates single-profile limits and preserves unlimited legacy options', () => {
+  const { api, queue } = load();
+  assert.equal(api.validateOptions({ profile }).maxNewVideos, null);
+  assert.equal(api.validateOptions(options({ maxNewVideos: 50_000 })).maxNewVideos, 50_000);
+  for (const value of [0, -1, 1.5, '35', '', 50_001, Infinity, NaN, true]) {
+    assert.throws(() => queue.start(options({ maxNewVideos: value })), { code: 'INVALID_LIMIT' });
+  }
+  assert.equal(queue.snapshot().state, 'idle');
+});
+
+test('save limits trim batches and stop before any further discovery or save', async t => {
+  for (const cap of [1, 34, 35, 36, 50]) {
+    for (const pageSize of [7, 12, 80]) {
+      await t.test(`limit ${cap}, batch 35, page ${pageSize}`, async () => {
+        let queue;
+        const events = [];
+        const groups = new Map();
+        ({ queue } = load({ discoverPage: paginated(160, pageSize, events),
+          saveItem: async ({ item: entry }) => {
+            events.push(`save:${entry.mediaId}`);
+            const batch = queue.snapshot().batchNumber;
+            groups.set(batch, (groups.get(batch) || 0) + 1);
+            return result(entry);
+          } }));
+        queue.start(options({ maxNewVideos: cap }));
+        const finished = await queue.waitForIdle();
+        assert.equal(finished.state, 'completed');
+        assert.equal(finished.maxNewVideos, cap);
+        assert.equal(finished.committedNewSaves, cap);
+        assert.equal(finished.counts.saved, cap);
+        assert.equal(finished.counts.queued, 0);
+        assert.equal(finished.counts.deferred, finished.counts.discovered - cap);
+        assert.equal(finished.completionReason, 'profile_limit_reached');
+        assert.equal(finished.sourceExhausted, false);
+        assert.equal(events.filter(event => event.startsWith('discover:')).length, Math.ceil(cap / pageSize));
+        assert.equal(events.filter(event => event.startsWith('save:')).length, cap);
+        assert.ok(finished.items.filter(entry => entry.state === 'deferred')
+          .every(entry => entry.reason === 'profile_limit_reached' && entry.attempts === 0));
+        assert.deepEqual([...groups.values()], cap <= 35 ? [cap] : [35, cap - 35]);
+        queue.resume();
+        assert.equal((await queue.waitForIdle()).counts.saved, cap);
+      });
+    }
+  }
+});
+
+test('limit keeps the feed-exhaustion fact separate and gives the cap a consistent finish reason', async () => {
+  for (const [total, cap, reason] of [[18, 50, 'feed_exhausted'], [35, 35, 'profile_limit_reached']]) {
+    const { queue } = load({ discoverPage: paginated(total, 12) });
+    queue.start(options({ maxNewVideos: cap }));
+    const finished = await queue.waitForIdle();
+    assert.equal(finished.sourceExhausted, true);
+    assert.equal(finished.completionReason, reason);
+    assert.equal(finished.counts.saved, total);
+    assert.equal(finished.counts.deferred, 0);
+  }
+});
+
+test('scan-all discovers the full profile before applying its save limit after approval', async () => {
+  const saves = [];
+  const events = [];
+  const { queue } = load({ discoverPage: paginated(82, 12, events),
+    saveItem: async ({ item: entry }) => { saves.push(entry.mediaId); return result(entry); } });
+  queue.start(options({ mode: 'scan_all', maxNewVideos: 36 }));
+  const ready = await queue.waitForIdle();
+  assert.equal(ready.state, 'paused');
+  assert.equal(ready.phase, 'ready');
+  assert.equal(ready.sourceExhausted, true);
+  assert.equal(ready.counts.discovered, 82);
+  assert.equal(ready.completionReason, null);
+  assert.equal(events.length, 7);
+  assert.equal(saves.length, 0);
+  queue.resume();
+  const finished = await queue.waitForIdle();
+  assert.equal(finished.counts.saved, 36);
+  assert.equal(finished.counts.deferred, 46);
+  assert.equal(finished.completionReason, 'profile_limit_reached');
+  assert.equal(events.length, 7);
+});
+
+test('verified cached pages and duplicate discovery IDs leave the new-save allowance untouched', async () => {
+  const requests = [];
+  const { queue } = load({ discoverPage: async ({ cursor }) => {
+    const index = Number(cursor || 0);
+    requests.push(index);
+    if (index < 3) return { items: [item(1), ...Array.from({ length: 10 }, (_, offset) => item(index * 10 + offset + 2))],
+      nextCursor: String(index + 1), hasMore: true };
+    return { items: Array.from({ length: 10 }, (_, offset) => item(32 + offset)), nextCursor: '4', hasMore: true };
+  }, checkExisting: async ({ item: entry }) => Number(entry.mediaId) <= 31 ? { ...result(entry), cacheHit: true } : null });
+  queue.start(options({ maxNewVideos: 5 }));
+  const finished = await queue.waitForIdle();
+  assert.deepEqual(requests, [0, 1, 2, 3]);
+  assert.equal(finished.counts.alreadyDownloaded, 31);
+  assert.equal(finished.counts.saved, 5);
+  assert.equal(finished.counts.deferred, 5);
+  assert.equal(finished.completionReason, 'profile_limit_reached');
+});
+
+test('save-time cache hits, failed items, skipped items and transient retries do not consume the limit', async () => {
+  const attempts = new Map();
+  const { queue } = load({ discoverPage: paginated(20, 10), retryDelays: [0],
+    saveItem: async ({ item: entry }) => {
+      const count = (attempts.get(entry.mediaId) || 0) + 1;
+      attempts.set(entry.mediaId, count);
+      if (entry.mediaId === '1') return { ...result(entry), cacheHit: true };
+      if (entry.mediaId === '2') throw new Error('Failed physical transfer');
+      if (entry.mediaId === '3') throw Object.assign(new Error('Removed'), { code: 'MEDIA_UNAVAILABLE' });
+      if (entry.mediaId === '4' && count === 1) throw Object.assign(new Error('Temporary network error'), { code: 'NETWORK_FAILED' });
+      return result(entry);
+    } });
+  queue.start(options({ maxNewVideos: 2 }));
+  const finished = await queue.waitForIdle();
+  assert.equal(finished.state, 'completed_with_errors');
+  assert.equal(finished.counts.saved, 2);
+  assert.equal(finished.counts.alreadyDownloaded, 1);
+  assert.equal(finished.counts.failed, 1);
+  assert.equal(finished.counts.skipped, 1);
+  assert.equal(finished.counts.deferred, 5);
+  assert.equal(attempts.get('4'), 2);
+  assert.equal(attempts.has('6'), false);
+  assert.throws(() => queue.retryFailed(), { code: 'LIMIT_REACHED' });
+  assert.throws(() => queue.recordSaved('2', result(item(2))), { code: 'PROFILE_LIMIT_REACHED' });
+  assert.equal(queue.snapshot().committedNewSaves, 2, 'a conflicting extra receipt cannot exceed the cap');
+});
+
+test('manual retries use only the remaining allowance without resetting earlier saves', async () => {
+  let fail = true;
+  const saves = [];
+  const { queue } = load({ discoverPage: paginated(4, 4), saveItem: async ({ item: entry }) => {
+    saves.push(entry.mediaId);
+    if (fail && ['1', '2'].includes(entry.mediaId)) throw new Error('Transfer failed');
+    return result(entry);
+  } });
+  queue.start(options({ maxNewVideos: 3 }));
+  const first = await queue.waitForIdle();
+  assert.equal(first.counts.saved, 2);
+  assert.equal(first.completionReason, 'feed_exhausted');
+  fail = false;
+  queue.retryFailed();
+  const finished = await queue.waitForIdle();
+  assert.equal(finished.counts.saved, 3);
+  assert.equal(finished.completionReason, 'profile_limit_reached');
+  assert.deepEqual(saves, ['1', '2', '3', '4', '1']);
+  assert.equal(finished.counts.deferred, 1);
+});
+
+test('pause/resume preserves the allowance, including a Pause during the save that reaches it', async () => {
+  const active = deferred();
+  const saves = [];
+  let stopAt = '1';
+  const { queue } = load({ discoverPage: paginated(10, 10), saveItem: async ({ item: entry }) => {
+    saves.push(entry.mediaId);
+    if (entry.mediaId === stopAt) await active.promise;
+    return result(entry);
+  } });
+  queue.start(options({ maxNewVideos: 2 }));
+  await tick();
+  queue.pause();
+  active.resolve();
+  assert.equal((await queue.waitForIdle()).counts.saved, 1);
+  assert.equal(queue.snapshot().state, 'paused');
+  stopAt = null;
+  queue.resume();
+  const finished = await queue.waitForIdle();
+  assert.equal(finished.counts.saved, 2);
+  assert.deepEqual(saves, ['1', '2']);
+  assert.equal(finished.completionReason, 'profile_limit_reached');
+
+  const final = deferred();
+  const another = load({ discoverPage: paginated(10, 10), saveItem: async ({ item: entry }) => {
+    await final.promise; return result(entry);
+  } }).queue;
+  another.start(options({ maxNewVideos: 1 }));
+  await tick();
+  another.pause();
+  final.resolve();
+  assert.equal((await another.waitForIdle()).completionReason, 'profile_limit_reached');
+  assert.equal(another.snapshot().state, 'completed');
+});
+
+test('unresolved successful saves pause before another item and count once after receipt reconciliation', async () => {
+  let calls = 0;
+  let reconciled = false;
+  const { queue } = load({ discoverPage: paginated(10, 10), saveItem: async ({ item: entry }) => {
+    calls++;
+    if (!reconciled) throw Object.assign(new Error('File saved, history pending'), { code: 'CACHE_WRITE_FAILED' });
+    return result(entry);
+  } });
+  queue.start(options({ maxNewVideos: 1 }));
+  const paused = await queue.waitForIdle();
+  assert.equal(paused.state, 'paused');
+  assert.equal(paused.counts.saved, 0);
+  assert.equal(calls, 1);
+  reconciled = true;
+  queue.resume();
+  const finished = await queue.waitForIdle();
+  assert.equal(finished.committedNewSaves, 1);
+  assert.equal(finished.completionReason, 'profile_limit_reached');
+  assert.equal(calls, 2, 'the adapter is re-entered to reconcile the same item, never another media ID');
+  queue.recordSaved('1', result(item(1)));
+  assert.equal(queue.snapshot().committedNewSaves, 1, 'repeated receipt does not double-count');
+  assert.throws(() => queue.recordSaved('1', { ...result(item(1)), filename: 'different.mp4' }), { code: 'INVALID_RESULT' });
+  assert.throws(() => queue.recordSaved('2', result(item(2))), { code: 'INVALID_RESULT' }, 'unattempted deferred items have no physical-save receipt');
+});
+
+test('Stop keeps its reason when a late physical receipt reaches the limit and repeated receipts stay idempotent', async () => {
+  const { queue } = load({ discoverPage: paginated(10, 10), saveItem: async () => {
+    throw Object.assign(new Error('History pending'), { code: 'CACHE_WRITE_FAILED' });
+  } });
+  queue.start(options({ maxNewVideos: 1 }));
+  await queue.waitForIdle();
+  queue.stop();
+  await queue.waitForIdle();
+  queue.recordSaved('1', result(item(1)));
+  queue.recordSaved('1', result(item(1)));
+  const stopped = queue.snapshot();
+  assert.equal(stopped.state, 'stopped');
+  assert.equal(stopped.completionReason, 'user_stopped');
+  assert.equal(stopped.committedNewSaves, 1);
+  assert.equal(stopped.counts.canceled, 9);
+});
+
+test('worker-enforced limit discrepancies pause before scheduling later items', async () => {
+  let calls = 0;
+  const { queue } = load({ discoverPage: paginated(10, 10), saveItem: async () => {
+    calls++;
+    throw Object.assign(new Error('Limit reached in worker'), { code: 'PROFILE_LIMIT_REACHED' });
+  } });
+  queue.start(options({ maxNewVideos: 1 }));
+  const paused = await queue.waitForIdle();
+  assert.equal(paused.state, 'paused');
+  assert.equal(paused.counts.failed, 0);
+  assert.equal(calls, 1);
+});
+
+test('a confirmed browser Stop receipt counts once even when Chrome has no positive byte count', async () => {
+  const { queue } = load({ discoverPage: paginated(10, 10), saveItem: async ({ signal }) => {
+    return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+      reject(Object.assign(new Error('Stopped while Chrome completed'), { code: 'SAVE_CANCELLED' }));
+    }, { once: true }));
+  } });
+  queue.start(options({ maxNewVideos: 1 }));
+  await tick();
+  queue.stop();
+  await queue.waitForIdle();
+  const receipt = { filename: 'creator_R1.mp4', downloadId: 21 };
+  queue.recordSaved('1', receipt);
+  queue.recordSaved('1', receipt);
+  const stopped = queue.snapshot();
+  assert.equal(stopped.state, 'stopped');
+  assert.equal(stopped.completionReason, 'user_stopped');
+  assert.equal(stopped.counts.saved, 1);
+  assert.equal(stopped.counts.canceled, 9);
+  assert.equal(stopped.items[0].downloadId, 21);
+  assert.equal(stopped.items[0].bytesWritten, undefined);
+  assert.throws(() => queue.recordSaved('1', { ...receipt, downloadId: 22 }), { code: 'INVALID_RESULT' });
+  queue.recordSaved('1', { ...receipt, bytesWritten: 50 });
+  queue.recordSaved('1', receipt);
+  assert.equal(queue.snapshot().items[0].bytesWritten, 50, 'later status without bytes retains known size');
+  assert.throws(() => queue.recordSaved('1', { ...receipt, bytesWritten: 51 }), { code: 'INVALID_RESULT' });
+  assert.equal(queue.snapshot().committedNewSaves, 1);
+});
+
+test('native Stop receipts still require positive bytes and malformed browser receipts are rejected', async () => {
+  const { queue } = load({ discoverPage: paginated(1, 1), saveItem: async () => {
+    throw Object.assign(new Error('Receipt pending'), { code: 'RECONCILIATION_REQUIRED' });
+  } });
+  queue.start(options({ maxNewVideos: 1 }));
+  await queue.waitForIdle();
+  queue.stop();
+  await queue.waitForIdle();
+  for (const receipt of [
+    { filename: 'creator_R1.mp4' },
+    { filename: 'creator_R1.mp4', downloadId: -1 },
+    { filename: 'creator_R1.mp4', downloadId: 1.5 },
+    { filename: 'creator_R1.mp4', downloadId: '1' },
+    { filename: 'creator_R1.mp4', downloadId: 1, bytesWritten: 0 },
+    { filename: 'creator_R1.mp4', downloadId: 1, bytesWritten: -1 },
+  ]) assert.throws(() => queue.recordSaved('1', receipt), { code: 'INVALID_RESULT' });
+  assert.equal(queue.snapshot().committedNewSaves, 0);
+  queue.recordSaved('1', result(item(1)));
+  assert.equal(queue.snapshot().committedNewSaves, 1);
 });
 
 test('a stopped queue reconciles a physical save without scheduling another transfer', async () => {

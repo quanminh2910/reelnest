@@ -1,5 +1,8 @@
 import { profileSource } from "../instagram/profile-source.js";
 import { buildFilename, validateMedia, summarizeDownload } from "../shared/core.js";
+import "../shared/download-limits.js";
+
+const limits = globalThis.ReelSaverDownloadLimits;
 
 const ACTIVE = "reel-saver:bulk-active";
 const PREFS = "reel-saver:bulk-prefs";
@@ -10,6 +13,7 @@ const cancellationKey = (jobId, id, attemptId) => `${operationKey(jobId, id)}:${
 const pending = new Map();
 const canceled = new Set();
 let registration = Promise.resolve();
+let journal = Promise.resolve();
 const actions = new Set([
   "START", "PAGE", "RESOLVE", "DOWNLOAD", "STATUS", "CANCEL_ITEM", "ITEM_RESULT",
   "END", "REOPEN", "HEARTBEAT", "IDENTIFY", "SETTINGS_GET", "SETTINGS_SET",
@@ -81,7 +85,8 @@ function options(value) {
       !["folder", "downloads"].includes(value.destination)) {
     throw problem("INVALID_SETTINGS", "Choose a download mode, a batch size from 1 to 500, and a folder or Downloads.");
   }
-  return { mode: value.mode, batchSize: value.batchSize, destination: value.destination };
+  return { mode: value.mode, batchSize: value.batchSize, destination: value.destination,
+    maxNewVideos: limits.normalize(value.maxNewVideos) };
 }
 
 async function get(key) { return (await chrome.storage.session.get(key))[key]; }
@@ -96,6 +101,101 @@ async function locked(action) {
   registration = new Promise((resolve) => { release = resolve; });
   await before;
   try { return await action(); } finally { release(); }
+}
+
+// The registration lock can wait for a transfer during Stop. Keep short journal
+// transactions separate so that transfer can settle without waiting on Stop.
+async function mutate(action) {
+  const before = journal;
+  let release;
+  journal = new Promise(resolve => { release = resolve; });
+  await before;
+  try { return await action(); } finally { release(); }
+}
+
+function allowance(job) {
+  return { committed: Number.isSafeInteger(job.committedNewSaves) ? job.committedNewSaves : 0,
+    reserved: typeof job.reservationMediaId === "string" ? job.reservationMediaId : null };
+}
+
+function assertAllowance(job) {
+  if (limits.reached(job.options.maxNewVideos, allowance(job).committed)) {
+    throw problem("PROFILE_LIMIT_REACHED", "The new-video limit for this run has been reached. Start a new run to download more.", "limit");
+  }
+}
+
+async function reserveOperation(ctx, jobId, item, attemptId) {
+  return mutate(async () => {
+    const job = await currentJob(ctx, jobId);
+    const quota = allowance(job);
+    const previous = await get(operationKey(jobId, item.mediaId));
+    if (canceled.has(cancellationKey(jobId, item.mediaId, attemptId))) {
+      throw problem("SAVE_CANCELLED", "The download was canceled.");
+    }
+    if (["unknown", "prepared"].includes(previous?.state)) {
+      throw problem("RECONCILIATION_REQUIRED", "The previous folder save must be confirmed before this video can be attempted again.", "limit");
+    }
+    if (quota.reserved && quota.reserved !== item.mediaId) {
+      throw problem("RECONCILIATION_REQUIRED", "The previous video's save must be confirmed before another video can start.", "limit");
+    }
+    assertAllowance(job);
+    const operation = { jobId, mediaId: item.mediaId, shortcode: item.shortcode, attemptId,
+      state: "resolving", quotaState: "reserved", startedAt: Date.now(), destination: job.options.destination };
+    await put({ [operationKey(jobId, item.mediaId)]: operation,
+      [ACTIVE]: { ...job, committedNewSaves: quota.committed, reservationMediaId: item.mediaId, updatedAt: Date.now() } });
+    return operation;
+  });
+}
+
+async function writeOperation(ctx, jobId, mediaId, attemptId, patch, outcome) {
+  return mutate(async () => {
+    const job = await currentJob(ctx, jobId, { inactive: true, profile: false });
+    const key = operationKey(jobId, mediaId);
+    const previous = await get(key);
+    if (!previous || previous.attemptId !== attemptId) throw problem("STALE_OPERATION", "This result belongs to an older download attempt.");
+    // A receipt can be delivered more than once, including while Stop settles.
+    // A late cancellation/failure can never undo a committed physical save.
+    if (previous.quotaState === "committed") return previous;
+    if (previous.quotaState === "released") {
+      if (outcome === "released") return previous;
+      throw problem("STALE_OPERATION", "This attempt already ended without a saved file. Its late result cannot start or commit another save.");
+    }
+    const quota = allowance(job);
+    const next = { ...previous, ...patch };
+    let committed = quota.committed;
+    let reserved = quota.reserved;
+    if (outcome === "saved") {
+      if (previous.quotaState !== "reserved" || quota.reserved !== mediaId) {
+        throw problem("RECONCILIATION_REQUIRED", "This saved file does not have an active allowance reservation.", "limit");
+      }
+      if (limits.reached(job.options.maxNewVideos, committed)) {
+        throw problem("RECONCILIATION_REQUIRED", "A saved video could not be matched to its remaining allowance. Check the destination before continuing.", "limit");
+      }
+      next.quotaState = "committed";
+      committed++;
+      if (reserved === mediaId) reserved = null;
+    } else if (outcome === "released") {
+      next.quotaState = "released";
+      if (reserved === mediaId) reserved = null;
+    } else if (outcome === "unknown") {
+      next.quotaState = "reserved";
+      if (reserved && reserved !== mediaId) throw problem("RECONCILIATION_REQUIRED", "Another video still has an unresolved save.", "limit");
+      reserved = mediaId;
+    }
+    await put({ [key]: next, [ACTIVE]: { ...job, committedNewSaves: committed,
+      reservationMediaId: reserved, updatedAt: Date.now() } });
+    return next;
+  });
+}
+
+async function recordBrowser(ctx, jobId, mediaId, attemptId, download, patch = {}) {
+  const outcome = download?.state === "complete" ? "saved" : download?.state === "interrupted" ? "released" : "unknown";
+  return writeOperation(ctx, jobId, mediaId, attemptId, { ...patch,
+    state: outcome === "saved" ? "saved" : outcome === "released" ? "failed" : "in_progress",
+    ...(Number.isInteger(download?.id) ? { downloadId: download.id } : {}),
+    ...(download?.filename ? { filename: download.filename } : {}),
+    ...(download?.bytesWritten != null ? { bytesWritten: download.bytesWritten } : {}),
+  }, outcome);
 }
 
 async function tabAtProfile(tabId, username) {
@@ -180,6 +280,14 @@ async function start(ctx, message) {
   return locked(async () => {
     const selected = options(message.options);
     const old = await get(ACTIVE);
+    if (old?.reservationMediaId) {
+      const tab = await chrome.tabs.get(old.tabId).catch(() => null);
+      const lostHost = !tab || old.state === "interrupted" ||
+        old.tabId === ctx.tabId && old.documentId && ctx.documentId && old.documentId !== ctx.documentId;
+      throw problem("RECONCILIATION_REQUIRED", lostHost
+        ? "A previous save could not be confirmed. Check the destination or Chrome Downloads, then reload ReelNest at chrome://extensions and refresh Instagram before starting a new run."
+        : "A previous video's save is unresolved. Return to its original panel and confirm the save before starting another run.");
+    }
     if (old?.active) {
       const tab = await chrome.tabs.get(old.tabId).catch(() => null);
       if (tab && (!old.documentId || old.tabId !== ctx.tabId || old.documentId === ctx.documentId)) {
@@ -195,11 +303,18 @@ async function start(ctx, message) {
       schema: 1, jobId: crypto.randomUUID(), tabId: ctx.tabId, documentId: ctx.documentId,
       profile, options: selected, active: true, state: "running", cursor: null,
       exhausted: false, visited: [], createdAt: Date.now(), updatedAt: Date.now(),
+      committedNewSaves: 0, reservationMediaId: null,
       ...(typeof tab.autoDiscardable === "boolean" ? { previousAutoDiscardable: tab.autoDiscardable } : {}),
     };
     // Discard prevention is best effort. The queue still handles document loss.
     if (chrome.tabs.update) await chrome.tabs.update(ctx.tabId, { autoDiscardable: false }).catch(() => {});
-    try { await put({ [ACTIVE]: job }); } catch (error) { await restoreTab(job); throw error; }
+    try {
+      await mutate(async () => {
+        const latest = await get(ACTIVE);
+        if (latest?.reservationMediaId) throw problem("RECONCILIATION_REQUIRED", "The previous video's save must be confirmed before another run can start.");
+        await put({ [ACTIVE]: job });
+      });
+    } catch (error) { await restoreTab(job); throw error; }
     // Only the latest in-tab job is resumable. Remove previous jobs' metadata.
     if (old && old.jobId !== job.jobId) {
       const all = await chrome.storage.session.get(null).catch(() => ({}));
@@ -215,6 +330,7 @@ async function page(ctx, message) {
   const cursor = message.cursor ?? null;
   if (cursor !== null && (typeof cursor !== "string" || cursor.length > 4096)) throw problem("INVALID_CURSOR", "The profile cursor is invalid.", "discovery");
   if (job.lastPage?.inputCursor === cursor) return { ok: true, profile: job.profile, page: job.lastPage.page };
+  assertAllowance(job);
   if (job.cursor !== cursor || job.exhausted) throw problem("PAGINATION_STALLED", "The profile scan is out of sequence. Resume the original scan.", "discovery");
   const response = await source(ctx, { action: "page", profile: job.profile, cursor });
   const output = response.page;
@@ -229,7 +345,7 @@ async function page(ctx, message) {
   }
   const items = output.items.map((entry) => ({ ...checkItem(entry), username: job.profile.username }));
   const nextPage = { items, nextCursor: output.hasMore ? output.nextCursor : null, hasMore: output.hasMore };
-  await locked(async () => {
+  await locked(() => mutate(async () => {
     const current = await currentJob(ctx, job.jobId);
     if (current.cursor !== cursor) throw problem("STALE_PAGE", "A newer page result already advanced this scan.", "discovery", true);
     await put({
@@ -238,7 +354,7 @@ async function page(ctx, message) {
         visited: output.hasMore ? [...current.visited, output.nextCursor] : current.visited,
         lastPage: { inputCursor: cursor, page: nextPage }, updatedAt: Date.now() },
     });
-  });
+  }));
   return { ok: true, profile: job.profile, page: nextPage };
 }
 
@@ -275,6 +391,9 @@ async function reconcile(operation) {
 async function resolve(ctx, message, browser = false) {
   const entry = await member(ctx, message);
   const { job, item, attemptId } = entry;
+  if (browser ? job.options.destination !== "downloads" : job.options.destination !== "folder") {
+    throw problem("INVALID_DESTINATION", browser ? "This batch uses its chosen folder." : "This batch uses browser Downloads.");
+  }
   const key = operationKey(job.jobId, item.mediaId);
   if (pending.has(key)) return pending.get(key);
   const run = (async () => {
@@ -282,17 +401,16 @@ async function resolve(ctx, message, browser = false) {
     if (browser && previous && (Number.isInteger(previous.downloadId) || ["intent", "unknown"].includes(previous.state))) {
       const download = await reconcile(previous);
       if (download && download.state !== "interrupted") {
-        await put({ [key]: { ...previous, attemptId, state: download.state === "complete" ? "saved" : "in_progress", downloadId: download.id } });
+        await recordBrowser(ctx, job.jobId, item.mediaId, previous.attemptId, download, { attemptId });
         return { ok: true, download, filename: previous.filename };
       }
+      if (download?.state === "interrupted") await recordBrowser(ctx, job.jobId, item.mediaId, previous.attemptId, download);
     }
     if (previous?.state === "saved" && !browser) return { ok: true, alreadySaved: true,
       filename: previous.filename, result: { filename: previous.filename, ...(previous.bytesWritten != null ? { bytesWritten: previous.bytesWritten } : {}) } };
-    const operation = { jobId: job.jobId, mediaId: item.mediaId, shortcode: item.shortcode, attemptId,
-      state: "resolving", startedAt: Date.now(), destination: job.options.destination };
     const cancelKey = cancellationKey(job.jobId, item.mediaId, attemptId);
     if (canceled.has(cancelKey)) throw problem("SAVE_CANCELLED", "The download was canceled.");
-    await put({ [key]: operation });
+    await reserveOperation(ctx, job.jobId, item, attemptId);
     const response = await source(ctx, { action: "resolve", profile: job.profile, item });
     await currentJob(ctx, job.jobId);
     const media = validateMedia(response.media, item.shortcode);
@@ -300,33 +418,35 @@ async function resolve(ctx, message, browser = false) {
     if (canceled.has(cancelKey)) throw problem("SAVE_CANCELLED", "The download was canceled.");
     const filename = buildFilename(media);
     if (!browser) {
-      if (job.options.destination !== "folder") throw problem("INVALID_DESTINATION", "This batch uses browser Downloads.");
-      await put({ [key]: { ...operation, state: "prepared", filename: filename.split("/").pop() } });
+      await writeOperation(ctx, job.jobId, item.mediaId, attemptId, { state: "prepared", filename: filename.split("/").pop() });
       return { ok: true, media, filename: filename.split("/").pop() };
     }
-    if (job.options.destination !== "downloads") throw problem("INVALID_DESTINATION", "This batch uses its chosen folder.");
-    await put({ [key]: { ...operation, state: "intent", filename } });
+    await writeOperation(ctx, job.jobId, item.mediaId, attemptId, { state: "intent", filename });
     let id;
     try { id = await chrome.downloads.download({ url: media.url, filename, conflictAction: "uniquify", saveAs: false }); }
-    catch { await put({ [key]: { ...operation, state: "failed", filename } }); throw problem("DOWNLOAD_FAILED", "Chrome could not start this video. Retry it after checking Downloads.", "save", true); }
+    catch { await writeOperation(ctx, job.jobId, item.mediaId, attemptId, { state: "failed", filename }, "released"); throw problem("DOWNLOAD_FAILED", "Chrome could not start this video. Retry it after checking Downloads.", "save", true); }
     const stillCurrent = await currentJob(ctx, job.jobId, { profile: false }).catch(() => null);
     if (canceled.has(cancelKey) || !stillCurrent) {
       await chrome.downloads.cancel(id).catch(() => {});
-      await put({ [key]: { ...operation, state: "canceled", filename, downloadId: id } });
+      const download = await getOwnDownload(id);
+      await recordBrowser(ctx, job.jobId, item.mediaId, attemptId, download, { filename, downloadId: id });
+      if (!download || download.state === "in_progress") throw problem("RECONCILE_REQUIRED", "The canceled video's outcome is uncertain. Check Chrome Downloads before continuing.");
+      if (download.state === "complete") return { ok: true, download, filename };
       throw problem("SAVE_CANCELLED", "The download was canceled.");
     }
-    try { await put({ [key]: { ...operation, state: "in_progress", filename, downloadId: id } }); }
+    const download = await getOwnDownload(id) || { id, state: "in_progress" };
+    try { await recordBrowser(ctx, job.jobId, item.mediaId, attemptId, download, { filename, downloadId: id }); }
     catch { throw problem("RECONCILE_REQUIRED", "Chrome started the video but its status could not be recorded. Check Chrome Downloads before retrying."); }
-    return { ok: true, download: await getOwnDownload(id) || { id, state: "in_progress" }, filename };
+    return { ok: true, download, filename };
   })();
   pending.set(key, run);
   try { return await run; }
   catch (error) {
     const operation = await get(key);
     if (operation?.attemptId === attemptId && operation.state === "resolving") {
-      await put({ [key]: { ...operation,
+      await writeOperation(ctx, job.jobId, item.mediaId, attemptId, {
         state: error.code === "SAVE_CANCELLED" ? "canceled" : error.code === "MEDIA_UNAVAILABLE" ? "skipped" : "failed",
-        error: { code: error.code || "RESOLVE_FAILED", message: String(error.message).slice(0, 300) } } });
+        error: { code: error.code || "RESOLVE_FAILED", message: String(error.message).slice(0, 300) } }, "released");
     }
     throw error;
   } finally { if (pending.get(key) === run) pending.delete(key); }
@@ -340,8 +460,7 @@ async function operationStatus(ctx, message) {
   if (operation.attemptId !== attemptId) throw problem("STALE_OPERATION", "This status belongs to an older download attempt.");
   const download = await reconcile(operation);
   if (!download) throw problem("DOWNLOAD_MISSING", "This video is no longer in Chrome Downloads.");
-  await put({ [key]: { ...operation, downloadId: download.id, state: download.state === "complete" ? "saved" : download.state === "interrupted" ? "failed" : "in_progress",
-    ...(download.filename ? { filename: download.filename } : {}), ...(download.bytesWritten != null ? { bytesWritten: download.bytesWritten } : {}) } });
+  await recordBrowser(ctx, job.jobId, item.mediaId, attemptId, download);
   return { ok: true, download };
 }
 
@@ -356,22 +475,44 @@ async function cancelItem(ctx, message) {
   operation = await get(key);
   if (operation && operation.attemptId !== attemptId) throw problem("STALE_OPERATION", "This cancellation belongs to an older download attempt.");
   if (operation?.downloadId != null) await chrome.downloads.cancel(operation.downloadId).catch(() => {});
-  if (operation && operation.state !== "saved") await put({ [key]: { ...operation, state: "canceled" } });
-  return { ok: true };
+  if (operation?.quotaState === "released") return { ok: true, canceled: true };
+  let download;
+  if (operation?.destination === "downloads" && operation.state === "saved") download = await reconcile(operation);
+  if (operation && operation.state !== "saved") {
+    if (job.options.destination === "downloads" && (Number.isInteger(operation.downloadId) || ["intent", "unknown"].includes(operation.state))) {
+      download = await reconcile(operation);
+      await recordBrowser(ctx, job.jobId, item.mediaId, attemptId, download);
+      if (!download || download.state === "in_progress") throw problem("RECONCILE_REQUIRED", "The canceled video's outcome is uncertain. Check Chrome Downloads before continuing.");
+    } else if (operation.state === "prepared" || operation.state === "unknown") {
+      // A prepared native transfer belongs to the host. Only its writer knows
+      // whether bytes were committed or its incomplete file was removed.
+      throw problem("RECONCILIATION_REQUIRED", "The folder writer must confirm this video's outcome before the batch can be released.");
+    } else await writeOperation(ctx, job.jobId, item.mediaId, attemptId, { state: "canceled" }, "released");
+  }
+  return { ok: true, ...(download ? { download } : { canceled: true }) };
 }
 
 async function nativeResult(ctx, message) {
   const { job, item, attemptId } = await member(ctx, message, true, false);
   if (job.options.destination !== "folder") throw problem("INVALID_DESTINATION", "Use Chrome's download status for browser-managed files.");
+  const result = message.result;
+  if (!result || !["saved", "skipped", "failed", "canceled"].includes(result.state)) throw problem("INVALID_RESULT", "The file result is invalid.");
+  const unresolved = result.error?.cleanupFailed === true;
+  // A host can know it never invoked the writer even if its RESOLVE response
+  // was lost before the worker registered that attempt. Fence that exact
+  // attempt before reading its journal so a delayed resolve cannot claim a slot.
+  if (["failed", "canceled"].includes(result.state) && !unresolved) canceled.add(cancellationKey(job.jobId, item.mediaId, attemptId));
   const key = operationKey(job.jobId, item.mediaId);
   const operation = await get(key);
   if (!operation || operation.attemptId !== attemptId) throw problem("STALE_OPERATION", "This result belongs to an older download attempt.");
-  const result = message.result;
-  if (!result || !["saved", "skipped", "failed", "canceled"].includes(result.state)) throw problem("INVALID_RESULT", "The file result is invalid.");
+  if (result.state === "saved" && (!Number.isSafeInteger(result.bytesWritten) || result.bytesWritten <= 0)) {
+    throw problem("INVALID_RESULT", "A saved file requires a confirmed positive byte count.");
+  }
   const filename = typeof result.filename === "string" ? result.filename.split(/[\\/]/).pop().slice(0, 200) : operation.filename;
-  await put({ [key]: { ...operation, state: result.state, filename,
+  await writeOperation(ctx, job.jobId, item.mediaId, attemptId, { state: unresolved ? "unknown" : result.state, filename,
     ...(Number.isFinite(result.bytesWritten) && result.bytesWritten >= 0 ? { bytesWritten: result.bytesWritten } : {}),
-    ...(result.error ? { error: String(result.error.message || result.error).slice(0, 300) } : {}), completedAt: Date.now() } });
+    ...(result.error ? { error: String(result.error.message || result.error).slice(0, 300) } : {}), completedAt: Date.now() },
+    result.state === "saved" ? "saved" : unresolved ? "unknown" : "released");
   return { ok: true };
 }
 
@@ -380,7 +521,12 @@ async function end(ctx, message) {
     const job = await currentJob(ctx, message.jobId, { inactive: true, profile: false });
     const terminal = ["completed", "completed_with_errors", "stopped"].includes(message.state);
     if (!terminal && !["paused", "incomplete", "running"].includes(message.state)) throw problem("INVALID_STATE", "The batch state is invalid.");
-    await put({ [ACTIVE]: { ...job, active: !terminal, state: message.state, updatedAt: Date.now() } });
+    await mutate(async () => {
+      const current = await currentJob(ctx, job.jobId, { inactive: true, profile: false });
+      // Retain ownership through cancellation and receipt settlement. A failed
+      // release must not let a new owner delete an unresolved operation.
+      await put({ [ACTIVE]: { ...current, active: true, state: message.state, updatedAt: Date.now() } });
+    });
     if (message.state === "stopped") {
       // Stop owns cancellation until in-flight acceptance settles. A following
       // job cannot delete this journal before an accepted Chrome file is canceled.
@@ -396,11 +542,35 @@ async function end(ctx, message) {
       for (const [key, operation] of Object.entries(latest)) {
         if (!key.startsWith(`${prefix(job.jobId)}operation:`) || operation.state === "saved") continue;
         if (Number.isInteger(operation.downloadId)) await chrome.downloads.cancel(operation.downloadId).catch(() => {});
-        await put({ [key]: { ...operation, state: "canceled" } });
+        if (operation.quotaState === "released") continue;
+        if (operation.destination === "downloads" && (Number.isInteger(operation.downloadId) || ["intent", "unknown"].includes(operation.state))) {
+          const download = await reconcile(operation);
+          await recordBrowser(ctx, job.jobId, operation.mediaId, operation.attemptId, download);
+          if (!download || download.state === "in_progress") throw problem("RECONCILE_REQUIRED", "A stopped video's outcome is uncertain. Check Chrome Downloads before releasing this batch.");
+        } else if (["prepared", "unknown"].includes(operation.state)) {
+          throw problem("RECONCILIATION_REQUIRED", "A folder save still needs confirmation. Record its history before releasing this batch.");
+        } else await writeOperation(ctx, job.jobId, operation.mediaId, operation.attemptId, { state: "canceled" }, "released");
       }
     }
-    if (terminal) await restoreTab(job);
-    return { ok: true };
+    const settled = await currentJob(ctx, job.jobId, { inactive: true, profile: false });
+    if (terminal && allowance(settled).reserved) throw problem("RECONCILIATION_REQUIRED", "A video's save is still unresolved. Confirm its result before releasing this batch.");
+    let savedResults;
+    if (terminal) {
+      if (message.state === "stopped" && job.options.destination === "downloads") {
+        const all = await chrome.storage.session.get(null);
+        savedResults = Object.entries(all)
+          .filter(([key, entry]) => key.startsWith(`${prefix(job.jobId)}operation:`) && entry.state === "saved" && entry.quotaState === "committed")
+          .map(([, entry]) => ({ mediaId: entry.mediaId, filename: entry.filename, downloadId: entry.downloadId,
+            ...(Number.isFinite(entry.bytesWritten) && entry.bytesWritten > 0 ? { bytesWritten: entry.bytesWritten } : {}) }));
+      }
+      await mutate(async () => {
+        const current = await currentJob(ctx, job.jobId, { inactive: true, profile: false });
+        if (allowance(current).reserved) throw problem("RECONCILIATION_REQUIRED", "A video's save is still unresolved.");
+        await put({ [ACTIVE]: { ...current, active: false, updatedAt: Date.now() } });
+      });
+      await restoreTab(job);
+    }
+    return { ok: true, committedNewSaves: allowance(settled).committed, ...(savedResults ? { savedResults } : {}) };
   });
 }
 
@@ -412,12 +582,15 @@ export async function handleBulkMessage(message, sender) {
     const action = message.type.slice("REEL_SAVER_BULK_".length);
     if (action === "SETTINGS_GET") {
       const prefs = (await chrome.storage.local.get(PREFS))[PREFS];
+      let maxNewVideos = null;
+      try { maxNewVideos = limits.normalize(prefs?.maxNewVideos); } catch { /* Ignore an invalid stored preference. */ }
       return { ok: true, settings: { mode: prefs?.mode === "scan_all" ? "scan_all" : "batches",
-        batchSize: Number.isSafeInteger(prefs?.batchSize) && prefs.batchSize > 0 && prefs.batchSize <= 500 ? prefs.batchSize : 35 } };
+        batchSize: Number.isSafeInteger(prefs?.batchSize) && prefs.batchSize > 0 && prefs.batchSize <= 500 ? prefs.batchSize : 35,
+        maxNewVideos } };
     }
     if (action === "SETTINGS_SET") {
       const selected = options({ ...message.settings, destination: "downloads" });
-      const settings = { mode: selected.mode, batchSize: selected.batchSize };
+      const settings = { mode: selected.mode, batchSize: selected.batchSize, maxNewVideos: selected.maxNewVideos };
       await chrome.storage.local.set({ [PREFS]: settings });
       return { ok: true, settings };
     }
@@ -435,14 +608,15 @@ export async function handleBulkMessage(message, sender) {
     if (action === "CANCEL_ITEM") return await cancelItem(ctx, message);
     if (action === "ITEM_RESULT") return await nativeResult(ctx, message);
     if (action === "END") return await end(ctx, message);
-    if (action === "REOPEN") return await locked(async () => {
+    if (action === "REOPEN") return await locked(() => mutate(async () => {
       const job = await currentJob(ctx, message.jobId, { inactive: true });
+      assertAllowance(job);
       await put({ [ACTIVE]: { ...job, active: true, state: "running", updatedAt: Date.now() } });
       if (chrome.tabs.update) await chrome.tabs.update(job.tabId, { autoDiscardable: false }).catch(() => {});
       return { ok: true, job: { jobId: job.jobId, profile: job.profile, options: job.options } };
-    });
+    }));
     if (action === "HEARTBEAT") {
-      await locked(async () => { const job = await currentJob(ctx, message.jobId, { profile: false }); await put({ [ACTIVE]: { ...job, updatedAt: Date.now() } }); });
+      await locked(() => mutate(async () => { const job = await currentJob(ctx, message.jobId, { profile: false }); await put({ [ACTIVE]: { ...job, updatedAt: Date.now() } }); }));
       return { ok: true };
     }
   } catch (error) {
@@ -457,10 +631,10 @@ export async function handleBulkMessage(message, sender) {
 export async function cleanupBulkTab(tabId) {
   const observed = await get(ACTIVE);
   if (observed?.tabId !== tabId) return;
-  await locked(async () => {
+  await locked(() => mutate(async () => {
     const current = await get(ACTIVE);
     if (current?.jobId !== observed.jobId || current.documentId !== observed.documentId) return;
-    await put({ [ACTIVE]: { ...current, active: false, state: "interrupted", updatedAt: Date.now() } });
+    await put({ [ACTIVE]: { ...current, active: !!allowance(current).reserved, state: "interrupted", updatedAt: Date.now() } });
     await restoreTab(current);
-  });
+  }));
 }

@@ -21,6 +21,7 @@ for (const candidate of candidates) {
 if (!executable) throw new Error('Set REEL_SAVER_BROWSER to a Chromium executable.');
 const writer = await readFile(path.join(root, 'src/content/folder-writer.js'), 'utf8');
 const cache = await readFile(path.join(root, 'src/content/profile-cache.js'), 'utf8');
+const limits = await readFile(path.join(root, 'src/shared/download-limits.js'), 'utf8');
 const queue = await readFile(path.join(root, 'src/content/bulk-queue.js'), 'utf8');
 const bulkPanel = await readFile(path.join(root, 'src/content/bulk-panel.js'), 'utf8');
 const panel = await readFile(path.join(root, 'src/content/profile-panel.js'), 'utf8');
@@ -29,7 +30,8 @@ const fixture = `(() => {
     total: 82, baseId: 100001, pageSize: 12, events: [], downloads: 0, resolves: 0, saved: 0, pickerCalls: 0,
     jobNumber: 0, nextId: 0, browserState: 'complete',
     failItem: null, failCount: 0, holdPage: false, heldPages: [], holdResolve: false, heldResolves: [],
-    failRelease: false, releaseCalls: 0, failAck: 0, report: null, mp4Playable: false };
+    failRelease: false, releaseCalls: 0, failAck: 0, failNegativeAck: 0, failTransfers: 0,
+    report: null, mp4Playable: false, completeOnCancel: false };
   const pageStyles = new CSSStyleSheet();
   pageStyles.replaceSync('body{font:16px system-ui;background:#fafafa;color:#222;margin:0}main{max-width:920px;margin:40px auto}header{padding:20px;border-bottom:1px solid #ddd}h1{font-size:24px}');
   document.adoptedStyleSheets=[pageStyles];
@@ -56,18 +58,20 @@ const fixture = `(() => {
     if(!state.mp4Playable)throw new Error('Generated MP4 is not playable.');
     state.mp4=await blob.arrayBuffer();return state.mp4;
   })();
-  window.fetch=async()=>{state.mediaTransfers=(state.mediaTransfers||0)+1;const bytes=await state.videoReady;return new Response(bytes,{status:200,headers:{'Content-Type':'video/mp4',...(!state.unknownLength?{'Content-Length':String(bytes.byteLength)}:{})}});};
+  window.fetch=async()=>{state.mediaTransfers=(state.mediaTransfers||0)+1;if(state.failTransfers>0){state.failTransfers--;throw new TypeError('Fixture video transfer failed');}const bytes=await state.videoReady;return new Response(bytes,{status:200,headers:{'Content-Type':'video/mp4',...(!state.unknownLength?{'Content-Length':String(bytes.byteLength)}:{})}});};
   const createObjectURL=URL.createObjectURL.bind(URL);
   URL.createObjectURL=blob=>{if(blob.type==='application/json')blob.text().then(text=>{state.report=JSON.parse(text);});return createObjectURL(blob);};
   const allDownloads=new Map();
+  const downloadOwners=new Map();
+  const nativePrepared=state.nativePrepared=new Map();
   const success = result=>({ok:true,...result});
   const mediaFor=item=>({mediaId:item.mediaId,shortcode:item.shortcode,pageUrl:'https://www.instagram.com/reel/'+item.shortcode+'/',username:profile.username,width:32,height:32,url:'https://scontent.cdninstagram.com/'+item.shortcode+'.mp4?secret=never_export'});
   window.chrome=Object.assign(window.chrome||{},{runtime:{id:'fixture-extension',getURL:p=>'chrome-extension://fixture-extension/'+p,
     onMessage:{addListener:listener=>{state.messageListener=listener;}},sendMessage:async request=>{
-      const type=request.type;state.events.push({type,mediaId:request.item?.mediaId,cursor:request.cursor});
+      const type=request.type;state.events.push({type,mediaId:request.item?.mediaId||request.mediaId,cursor:request.cursor,attemptId:request.attemptId,resultState:request.result?.state});
       if(type==='REEL_SAVER_SETTINGS_GET')return success({settings:{destination:state.destination}});
       if(type==='REEL_SAVER_SETTINGS_SET'){state.destination=request.settings.destination;return success({settings:{destination:state.destination}});}
-      if(type==='REEL_SAVER_BULK_SETTINGS_GET')return success({settings:{mode:state.mode,batchSize:state.batchSize}});
+      if(type==='REEL_SAVER_BULK_SETTINGS_GET')return success({settings:{mode:state.mode,batchSize:state.batchSize,maxNewVideos:state.maxNewVideos??null}});
       if(type==='REEL_SAVER_BULK_SETTINGS_SET'){Object.assign(state,request.settings);return success({settings:request.settings});}
       if(type==='REEL_SAVER_BULK_IDENTIFY')return success({profile:state.identifyProfile||profile});
       if(type==='REEL_SAVER_BULK_START'){state.jobNumber++;state.job={jobId:'fixture_job_'+state.jobNumber,profile,options:request.options};return success({job:state.job});}
@@ -77,19 +81,25 @@ const fixture = `(() => {
         return success({profile,page:{items:page,nextCursor:after<state.total?String(after):null,hasMore:after<state.total}});
       }
       if(type==='REEL_SAVER_BULK_RESOLVE'){
+        const key=request.jobId+':'+request.item.mediaId;
+        if(nativePrepared.has(key))return {ok:false,error:{code:'RECONCILIATION_REQUIRED',message:'The previous native result must be acknowledged before another lookup'}};
         state.resolves++;if(state.holdResolve)await new Promise(resolve=>state.heldResolves.push(resolve));
         if(state.failItem===request.item.mediaId&&state.failCount++===0)return {ok:false,error:{code:'NO_MP4',message:'No progressive MP4 was available.',stage:'resolve',retryable:false}};
+        nativePrepared.set(key,request.attemptId);
         return success({media:mediaFor(request.item),filename:profile.username+'_'+request.item.shortcode+'.mp4'});
       }
       if(type==='REEL_SAVER_BULK_ITEM_RESULT'){
         if(request.result.state==='saved'&&state.failAck>0){state.failAck--;return {ok:false,error:{code:'STORAGE_FAILED',message:'Fixture result acknowledgement lost'}};}
+        if(request.result.state!=='saved'&&state.failNegativeAck>0){state.failNegativeAck--;return {ok:false,error:{code:'STORAGE_FAILED',message:'Fixture failed result acknowledgement lost'}};}
+        const key=request.jobId+':'+request.mediaId;
+        if(!request.result.error?.cleanupFailed)nativePrepared.delete(key);
         if(request.result.state==='saved')state.saved++;return success({});
       }
       if(type==='REEL_SAVER_BULK_DOWNLOAD'){
         state.downloads++;
         if(state.failItem===request.item.mediaId&&state.failCount++===0)return {ok:false,error:{code:'SAVE_FAILED',message:'A fixture transfer failed.',stage:'download',retryable:false}};
         const download={id:++state.nextId,state:state.browserState,filename:profile.username+'_'+request.item.shortcode+'.mp4'};
-        allDownloads.set(request.attemptId,download);if(download.state==='complete')state.saved++;
+        allDownloads.set(request.attemptId,download);downloadOwners.set(request.attemptId,{jobId:request.jobId,mediaId:request.item.mediaId});if(download.state==='complete')state.saved++;
         return success({download,filename:download.filename});
       }
       if(type==='REEL_SAVER_BULK_STATUS'){
@@ -97,15 +107,20 @@ const fixture = `(() => {
         if(state.browserState==='complete'&&download.state!=='complete'){download.state='complete';state.saved++;}
         return success({download:{...download}});
       }
-      if(type==='REEL_SAVER_BULK_CANCEL_ITEM'){const download=allDownloads.get(request.attemptId);if(download)download.state='interrupted';return success({});}
-      if(type==='REEL_SAVER_BULK_END'){state.releaseCalls++;if(state.failRelease)return {ok:false,error:{code:'NETWORK_FAILED',message:'Fixture release failed'}};return success({});}
+      if(type==='REEL_SAVER_BULK_CANCEL_ITEM'){const download=allDownloads.get(request.attemptId);if(download&&download.state!=='complete'){download.state=state.completeOnCancel?'complete':'interrupted';if(download.state==='complete')state.saved++;}return success({});}
+      if(type==='REEL_SAVER_BULK_END'){
+        state.releaseCalls++;if(state.failRelease)return {ok:false,error:{code:'NETWORK_FAILED',message:'Fixture release failed'}};
+        if([...nativePrepared.keys()].some(key=>key.startsWith(request.jobId+':')))return {ok:false,error:{code:'RECONCILIATION_REQUIRED',message:'Fixture folder result remains unresolved'}};
+        const savedResults=request.state==='stopped'?[...allDownloads].filter(([attemptId,download])=>downloadOwners.get(attemptId)?.jobId===request.jobId&&download.state==='complete').map(([attemptId,download])=>({...downloadOwners.get(attemptId),filename:download.filename,downloadId:download.id})):[];
+        return success({savedResults});
+      }
       if(type==='REEL_SAVER_BULK_REOPEN')return success({job:state.job});
       if(type==='REEL_SAVER_INSPECT')return {ok:false,error:{code:'NOT_REEL',message:'Open a Reel to download it here.'}};
       return {ok:false,error:{code:'UNKNOWN',message:'Unexpected fixture message '+type}};
     }}});
 })();`;
 const html = `<!doctype html><html><head><meta charset="utf-8"><title>Bulk fixture</title></head><body><main><header><h1>example_creator</h1><p>Profile bulk fixture</p></header></main>
-<script>${fixture.replaceAll('</script','<\\/script')}</script><script>${writer.replaceAll('</script','<\\/script')}</script><script>${cache.replaceAll('</script','<\\/script')}</script><script>${queue.replaceAll('</script','<\\/script')}</script><script>${bulkPanel.replaceAll('</script','<\\/script')}</script><script>${panel.replaceAll('</script','<\\/script')}</script></body></html>`;
+<script>${fixture.replaceAll('</script','<\\/script')}</script><script>${writer.replaceAll('</script','<\\/script')}</script><script>${cache.replaceAll('</script','<\\/script')}</script><script>${limits.replaceAll('</script','<\\/script')}</script><script>${queue.replaceAll('</script','<\\/script')}</script><script>${bulkPanel.replaceAll('</script','<\\/script')}</script><script>${panel.replaceAll('</script','<\\/script')}</script></body></html>`;
 const profile = await mkdtemp(path.join(tmpdir(), 'reel-saver-bulk-smoke-'));
 let child;
 let ws;
@@ -203,15 +218,39 @@ try {
     for (let count = 0; count < index; count++) await key('ArrowDown', 'ArrowDown', 40);
     await key('Enter', 'Enter', 13);
   }
+  async function selectLimitMode(value) {
+    await click(query('[data-role=bulk-limit-mode]'));
+    await key(value==='custom'?'End':'Home',value==='custom'?'End':'Home',value==='custom'?35:36);
+    await key('Enter','Enter',13);
+  }
+  async function enterLimit(value) {
+    await click(query('[data-role=bulk-limit]'));
+    await page('Input.dispatchKeyEvent',{type:'keyDown',key:'a',code:'KeyA',windowsVirtualKeyCode:65,modifiers:2});
+    await page('Input.dispatchKeyEvent',{type:'keyUp',key:'a',code:'KeyA',windowsVirtualKeyCode:65,modifiers:2});
+    await key('Backspace','Backspace',8);
+    if(value)await page('Input.insertText',{text:value});
+    await key('Tab','Tab',9);
+  }
   await page('Page.navigate',{url:'https://www.instagram.com/example_creator/reels/'});
   await waitFor(`${launcher}`,'profile launcher');
   await click(launcher);
   await waitFor(`${query('[data-role=bulk-start]')} && !${query('[data-role=bulk-start]')}.disabled`,'bulk controls');
   await waitFor('window.__fixture.mp4Playable','playable MP4 fixture');
   assert.equal(await evaluate(`${query('[data-role=bulk-size]')}.value`),'35');
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit-mode]')}.value`),'unlimited');
   assert.equal(await evaluate('window.__fixture.jobNumber'),0,'opening panel never starts bulk automatically');
   await evaluate(`${query('[data-role=bulk-start]')}.click()`);
   assert.equal(await evaluate('window.__fixture.jobNumber'),0,'synthetic start ignored');
+  await selectLimitMode('custom');
+  assert.equal(await evaluate(`${query('[data-role=bulk-start]')}.disabled`),true,'empty custom limit blocks Start');
+  for(const invalid of ['0','-1','1.5','1e2','50001','500000','1000000']){
+    await enterLimit(invalid);
+    assert.equal(await evaluate(`${query('[data-role=bulk-start]')}.disabled`),true,`invalid limit ${invalid} blocks Start`);
+    assert.equal(await evaluate(`${query('[data-role=bulk-limit]')}.getAttribute('aria-invalid')`),'true');
+    assert.equal(await evaluate('window.__fixture.jobNumber'),0,'invalid limits cannot start a job');
+  }
+  await selectLimitMode('unlimited');
+  await waitFor(`${query('[data-role=bulk-start]')}.disabled===false && window.__fixture.maxNewVideos===null`,'unlimited preference restored');
   await click(query('[data-role=choose-folder]'));
   await waitFor(`${query('[data-role=destination]')}.value==='chosen'`,'folder selected');
   await click(query('[data-role=bulk-start]'));
@@ -547,6 +586,125 @@ try {
   await click(query('[data-role=cache-import-cancel]'));
   await waitFor(`${query('[data-role=cache-import-cancel]')}.hidden && !${query('[data-role=cache-clear]')}.disabled`,'import Cancel releases clear action');
   console.log('PASS clear action is unavailable during active and paused jobs or report import');
+
+  await selectLimitMode('custom');
+  await enterLimit('2');
+  await waitFor(`window.__fixture.maxNewVideos===2 && !${query('[data-role=bulk-start]')}.disabled`,'custom limit saved');
+  assert.equal(await evaluate(`${query('[data-role=bulk-start]')}.textContent`),'Download up to 2 new Reels');
+  const beforeLimitedNative={files:(await mp4Files()).length,transfers:await evaluate('window.__fixture.mediaTransfers'),resolves:await evaluate('window.__fixture.resolves')};
+  await evaluate('window.__fixture.baseId=500001;window.__fixture.total=30;window.__fixture.events=[];window.__fixture.report=null');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'native cap reached and released');
+  assert.equal(await evaluate('window.__fixture.job.options.maxNewVideos'),2,'worker receives the selected cap');
+  assert.equal((await mp4Files()).length,beforeLimitedNative.files+2,'cached video does not consume native cap');
+  assert.equal(await evaluate('window.__fixture.mediaTransfers'),beforeLimitedNative.transfers+2);
+  assert.equal(await evaluate('window.__fixture.resolves'),beforeLimitedNative.resolves+2);
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'2');
+  assert.equal(await evaluate(`${query('[data-count=alreadyDownloaded]')}.textContent`),'1');
+  assert.equal(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_PAGE').length"),1,'small cap avoids unnecessary discovery pages');
+  await click(query('[data-role=bulk-report]'));
+  await waitFor('window.__fixture.report?.completionReason==="profile_limit_reached"','limited report exported');
+  const limitedReport=await evaluate('window.__fixture.report');
+  assert.equal(limitedReport.version,1);
+  assert.equal(limitedReport.maxNewVideos,2);
+  assert.equal(limitedReport.committedNewSaves,2);
+  assert.equal(limitedReport.sourceExhausted,false,'limit is not full-profile completion');
+  assert.ok(limitedReport.counts.deferred>0);
+  assert.ok(limitedReport.items.filter(item=>item.state==='deferred').every(item=>item.reason==='profile_limit_reached'));
+  console.log('PASS strict limit validation, saved preferences, native cap excludes cache hits, no extra discovery, compatible limited report');
+
+  await selectDestination('downloads');
+  await evaluate('window.__fixture.total=9;window.__fixture.browserState="in_progress";window.__fixture.events=[]');
+  const downloadsBeforeLimitedPause=await evaluate('window.__fixture.downloads');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`window.__fixture.downloads===${downloadsBeforeLimitedPause+1}`,'limited browser transfer accepted');
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit-mode]')}.disabled`),true,'limit mode frozen while running');
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit]')}.disabled`),true,'limit frozen while running');
+  await click(query('[data-role=bulk-pause]'));
+  await evaluate('window.__fixture.browserState="complete"');
+  await waitFor(`${query('[data-role=bulk-start]')}.textContent==='Resume'`,'limited browser job paused');
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit]')}.disabled`),true,'limit remains frozen while paused');
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'1');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'limited browser Resume preserves allowance');
+  assert.equal(await evaluate('window.__fixture.downloads'),downloadsBeforeLimitedPause+2,'Resume uses only remaining allowance');
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'2');
+  console.log('PASS browser cap, frozen active/paused settings, Resume retains committed allowance');
+
+  await click(query('[data-role=bulk-mode]'));await key('End','End',35);await key('Enter','Enter',13);
+  await waitFor("window.__fixture.mode==='scan_all' && !document.querySelector('[data-reel-saver-panel]').shadowRoot.querySelector('[data-role=bulk-start]').disabled",'limited scan-all selected');
+  await evaluate('window.__fixture.total=27;window.__fixture.events=[]');
+  const downloadsBeforeLimitedScan=await evaluate('window.__fixture.downloads');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-start]')}.textContent==='Download up to 2 new Reels' && ${query('[data-role=bulk-limit]')}.disabled`,'limited full scan ready for approval');
+  assert.equal(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_PAGE').length"),3,'scan-all still discovers the entire feed');
+  assert.equal(await evaluate('window.__fixture.downloads'),downloadsBeforeLimitedScan,'scan-all still requires approval');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'limited scan-all saves only its allowance');
+  assert.equal(await evaluate('window.__fixture.downloads'),downloadsBeforeLimitedScan+2);
+  console.log('PASS scan-all discovers the full feed, presents the save cap, and needs explicit approval');
+
+  await click(query('[data-role=bulk-mode]'));await key('Home','Home',36);await key('Enter','Enter',13);
+  await waitFor(`window.__fixture.mode==='batches' && !${query('[data-role=bulk-start]')}.disabled`,'limited batch mode restored');
+  await evaluate('window.__fixture.total=4;window.__fixture.failItem="500001";window.__fixture.failCount=0');
+  const downloadsBeforeLimitedFailure=await evaluate('window.__fixture.downloads');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'failed item does not consume the cap');
+  assert.equal(await evaluate('window.__fixture.downloads'),downloadsBeforeLimitedFailure+3,'one failed attempt plus two successful saves');
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'2');
+  assert.equal(await evaluate(`${query('[data-count=failed]')}.textContent`),'1');
+  assert.equal(await evaluate(`${query('[data-role=bulk-retry]')}.disabled`),true,'failed retries cannot exceed an exhausted cap');
+  console.log('PASS failures do not consume allowance and Retry failed cannot exceed the finished cap');
+
+  await evaluate('window.__fixture.total=3;window.__fixture.failItem=null;window.__fixture.browserState="in_progress";window.__fixture.completeOnCancel=true;window.__fixture.report=null');
+  const downloadsBeforeStopRace=await evaluate('window.__fixture.downloads');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`window.__fixture.downloads===${downloadsBeforeStopRace+1}`,'browser transfer before Stop/completion race');
+  await click(query('[data-role=bulk-stop]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Stopped. 1 saved') && !${query('[data-role=bulk-start]')}.disabled`,'Stop reconciles a browser file completed just before cancellation');
+  assert.equal(await evaluate('window.__fixture.downloads'),downloadsBeforeStopRace+1,'Stop receipt reconciliation does not start another video');
+  assert.equal(await evaluate(`${query('[data-count=saved]')}.textContent`),'1');
+  await click(query('[data-role=bulk-report]'));
+  await waitFor('window.__fixture.report?.completionReason==="user_stopped"','Stop race report exported');
+  assert.equal(await evaluate('window.__fixture.report.committedNewSaves'),1,'physical completion is included in stopped run allowance');
+  assert.equal(await evaluate('window.__fixture.report.counts.saved'),1);
+  assert.equal(await evaluate('window.__fixture.report.items.filter(item=>item.state==="saved").length'),1);
+  console.log('PASS Browser Downloads completion racing Stop is retained as a saved receipt with user_stopped reason');
+
+  await click(query('[data-role=choose-folder]'));
+  await evaluate('window.__fixture.total=1;window.__fixture.baseId=800001;window.__fixture.failTransfers=1;window.__fixture.failNegativeAck=1;window.__fixture.events=[]');
+  const beforeNegativeAck={files:(await mp4Files()).length,resolves:await evaluate('window.__fixture.resolves'),transfers:await evaluate('window.__fixture.mediaTransfers')};
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-start]')}.textContent==='Resume'`,'lost no-output acknowledgement pauses before another attempt');
+  assert.equal((await mp4Files()).length,beforeNegativeAck.files);
+  assert.equal(await evaluate('window.__fixture.nativePrepared.size'),1,'lost negative acknowledgement retains its prepared reservation');
+  assert.equal(await evaluate('window.__fixture.resolves'),beforeNegativeAck.resolves+1);
+  assert.equal(await evaluate('window.__fixture.mediaTransfers'),beforeNegativeAck.transfers+1);
+  const failedAttempt=await evaluate("window.__fixture.events.find(event=>event.type==='REEL_SAVER_BULK_ITEM_RESULT'&&event.resultState==='failed').attemptId");
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Completed.') && !${query('[data-role=bulk-start]')}.disabled`,'Resume records failed old attempt before downloading again');
+  assert.equal((await mp4Files()).length,beforeNegativeAck.files+1,'exactly one completed file is created after failed transfer acknowledgement recovery');
+  assert.equal(await evaluate('window.__fixture.nativePrepared.size'),0);
+  const recoveryEvents=await evaluate('window.__fixture.events');
+  const oldAttemptAcks=recoveryEvents.filter(event=>event.type==='REEL_SAVER_BULK_ITEM_RESULT'&&event.attemptId===failedAttempt);
+  assert.equal(oldAttemptAcks.length,2,'metadata retry acknowledges the original failed attempt');
+  const secondLookup=recoveryEvents.map((event,index)=>({...event,index})).filter(event=>event.type==='REEL_SAVER_BULK_RESOLVE')[1];
+  assert.ok(recoveryEvents.indexOf(oldAttemptAcks[1])<secondLookup.index,'negative acknowledgement settles before a new media lookup');
+  console.log('PASS lost native failure acknowledgement retains its original attempt and Resume settles metadata before a fresh transfer');
+
+  await evaluate('window.__fixture.baseId=800002;window.__fixture.holdResolve=true;window.__fixture.events=[]');
+  const beforeHeldResolve={files:(await mp4Files()).length,transfers:await evaluate('window.__fixture.mediaTransfers')};
+  await click(query('[data-role=bulk-start]'));
+  await waitFor('window.__fixture.heldResolves.length===1','held native lookup before Stop');
+  await click(query('[data-role=bulk-stop]'));
+  await evaluate('window.__fixture.holdResolve=false;window.__fixture.heldResolves.splice(0).forEach(resolve=>resolve())');
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Stopped.') && !${query('[data-role=bulk-start]')}.disabled`,'Stop acknowledges a late prepared lookup without invoking the writer');
+  assert.equal((await mp4Files()).length,beforeHeldResolve.files);
+  assert.equal(await evaluate('window.__fixture.mediaTransfers'),beforeHeldResolve.transfers,'late lookup after Stop never transfers bytes');
+  assert.equal(await evaluate('window.__fixture.nativePrepared.size'),0,'Stop releases the no-output prepared reservation');
+  assert.equal(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_ITEM_RESULT'&&event.resultState==='canceled').length"),1);
+  console.log('PASS Stop during a held native lookup acknowledges its late prepared response and releases without writing');
+
   assert.deepEqual(exceptions,[],'no uncaught browser exceptions');
   console.log('Screenshot: artifacts/bulk-panel-preview.png');
   await send('Browser.close');

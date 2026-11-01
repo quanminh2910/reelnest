@@ -1,6 +1,6 @@
 # ReelNest
 
-A Chrome extension for saving Instagram Reels individually or in profile batches, with automatic profile folders and persistent download history. This is an independent extension in a separate folder; the archived ESUIT packages are unchanged.
+A Chrome extension for saving Instagram Reels individually or in profile batches, with optional download limits, automatic profile folders, and persistent download history. This is an independent extension in a separate folder; the archived ESUIT packages are unchanged.
 
 ## Install locally
 
@@ -13,7 +13,9 @@ There is no build step or dependency installation. Node.js is needed only for de
 
 ### Update an existing installation
 
-On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.4.2.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.5.0.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+
+Version **0.5.0** adds an optional maximum number of newly saved videos for a single-profile bulk run. **Unlimited** preserves the previous behavior. A custom limit applies to both Library folder and Browser Downloads, survives pause/resume, and appears in the exported report. Cached videos and failed attempts do not consume it. Profile queues are planned separately.
 
 Version **0.4.2** renames Reel Saver to **ReelNest**. The project folder is named `reelnest`. If your unpacked extension points to the previous `reel-saver` path, remove that old entry and load the `reelnest` folder, then refresh Instagram. Existing library folder names, `.reel-saver-*.json` metadata, and older download reports remain compatible. Keep using your current library root; it does not need to be renamed. Browser Downloads continues saving under `Downloads/Reel Saver`.
 
@@ -40,7 +42,7 @@ Reel Saver/
 
 Select this parent again after a refresh or restart. The stored numeric Instagram profile ID identifies the child, so changing a username or manually renaming a complete profile folder does not create a second collection. Ambiguous identities and nonempty folders without verified ownership are preserved; a safe suffix is used for a new collection when needed. Selecting an existing profile child as the parent produces a clear error.
 
-**Skip videos already downloaded** is enabled by default. A recorded video counts as **Already saved** only when its file exists with the recorded byte size and an MP4 header. Missing, truncated, or invalid files remain eligible to download. Cache hits do not consume the batch's new-download quota, and cached pages are still scanned to the actual end of the profile. Uncheck the option to deliberately download another uniquely named copy. These quick checks do not calculate a full-file hash or test playback.
+**Skip videos already downloaded** is enabled by default. A recorded video counts as **Already saved** only when its file exists with the recorded byte size and an MP4 header. Missing, truncated, or invalid files remain eligible to download. Cache hits do not consume the batch size or the new-save limit; cached pages are scanned until the limit is reached or the profile feed ends. Uncheck the option to deliberately download another uniquely named copy, which counts toward the limit. These quick checks do not calculate a full-file hash or test playback.
 
 History is committed after a video file closes successfully. A pending record protects interrupted saves; confirmed complete files can be recovered on the next open. If a file saves but its history update fails, **Resume**, **Record history and release**, or the single-Reel **Retry history update** records that file without downloading it again. Keep the tab open while resolving that error. An uncertain leftover file pauses the library instead of being marked as complete or silently duplicated. Restore a known-good cache backup or resolve that file in its profile folder before retrying. Both corrupt cache files or unsupported schemas require manual recovery; a general repair tool is outside this release.
 
@@ -93,14 +95,23 @@ Version **0.3.1** retained operation and fragment defaults, filled a declared mi
 2. Click **ReelNest** on the profile to open the panel.
 3. Choose your central **Library folder** or **Browser Downloads**. Bulk captures that profile's child folder for the job; the per-file Save As option is for single downloads.
 4. In **Profile downloads**, leave **Download in batches** selected and set **Reels per batch** (default **35**, supported range 1–500).
-5. Click **Download all Reels**. The extension discovers a batch, saves its videos sequentially, then discovers the next batch until the profile feed ends. Page overflow and duplicate IDs are carried/filtered correctly.
+5. Leave the new-video limit **Unlimited**, or choose a custom whole number from **1–50,000**.
+6. Start the download. The extension discovers a batch, saves its videos sequentially, then discovers the next batch until the limit is reached or the profile feed ends. Page overflow and duplicate IDs are carried/filtered correctly.
 
-**Scan all first** discovers the complete list before saving. When the scan finishes, click **Download all N Reels** to begin. Batch size controls grouping, not parallel downloads or the total number saved.
+**Scan all first** discovers the complete list before saving. When the scan finishes, approve the download to begin. A custom limit still applies to saves; it does not shorten this full scan. Batch size controls grouping, not parallel downloads or the total number saved.
+
+The limit counts confirmed successful new saves in this run. For example, batch size **35** with limit **50** saves up to **35**, then **15**; already-saved files, duplicate discovery IDs, unavailable Reels, and failed attempts do not use the allowance. A successful retry does. Browser Downloads counts completed downloads in this run and cannot check arbitrary existing files in its destination folder.
+
+The selection follows Instagram's returned profile order, which may include pinned items. A limit means **up to N new videos**, rather than a guarantee of the latest N or that N eligible videos exist. Instagram can return a complete page with more IDs than needed; surplus discovered items are deferred when the limit is reached. No further page or media lookup is scheduled after that point. **Limit reached** is distinct from finishing the whole profile, and reports preserve whether the source was actually exhausted.
+
+Mode, batch size, destination, duplicate preference, and limit are captured when the run starts. Pause/resume keeps the same allowance. Stop the run before changing settings. Starting another run resets its allowance; verified Library folder history still skips existing videos. A saved file awaiting its history/status acknowledgement holds its allowance slot until the outcome is settled, preventing a duplicate save or overshoot.
+
+If the Instagram document is refreshed or closed during an unresolved save, its in-tab controller cannot resume. ReelNest keeps the uncertain session record and blocks another bulk run. Check the destination or Chrome Downloads, reload ReelNest at `chrome://extensions`, refresh Instagram, and select the library root again before starting a new run. Reloading the extension resets session allowances; durable library history and pending-file checks still apply. This is an explicit interrupted-run reset, not automatic recovery of the previous run.
 
 - **Pause** finishes the current page/video, then waits. **Resume** continues the same job without repeating completed files.
 - **Stop** stops scheduling and cancels an active transfer where possible. Completed files stay saved.
-- **Retry failed** retries only failed items from a finished batch job.
-- **Export report** saves a JSON summary with discovered IDs, results, output filenames, and failure reasons. Reports omit signed media URLs, credentials, and absolute local paths.
+- **Retry failed** retries only failed items from a finished batch job, using its remaining allowance. A run that has reached its limit requires a new run to save more.
+- **Export report** saves a version-1 JSON summary with discovered IDs, results, output filenames, failure/deferred reasons, the configured limit, committed new saves, and the completion reason. Existing saved-entry fields remain compatible with the report importer. Reports omit signed media URLs, credentials, and absolute local paths.
 
 The panel shows found/saved/already-saved/failed/skipped counts, the current batch/item, and progress when the transfer provides it. The full total remains unknown until discovery ends. A broken or incomplete scan is reported separately from successful completion. Closing the panel keeps the queue running.
 
@@ -181,7 +192,7 @@ npm run test:extension
 
 `test:profile` exercises the injected profile panel against local browser fixtures, including Instagram-style navigation and folder/download controls. The picker returns a real temporary origin-private directory handle. Media requests use fixtures, so the tests do not touch personal folders or Instagram accounts.
 
-`test:bulk` exercises the actual queue, panel, and stream writer against a local 82-item feed, including 35/35/12 batching, scan-all mode, pause/resume, retries, stops, lost acknowledgement recovery, and report import. `test:extension` loads the unpacked extension into an isolated Edge/Chromium profile and checks worker/content messaging, real origin-private filesystem writes, cache skips without new media requests, missing-file recovery, reload persistence, and two-profile isolation. Instagram modules are fixtures; neither suite accesses your personal browser profile or account. Set `REEL_SAVER_BROWSER` to a compatible unpacked-extension-capable Chromium executable if needed.
+`test:bulk` exercises the actual queue, panel, and stream writer against a local 82-item feed, including 35/35/12 batching, scan-all mode, pause/resume, retries, stops, lost acknowledgement recovery, and report import. It also checks custom-limit validation, cached/failed items, remaining allowance, and Stop/completion races. `test:extension` loads the unpacked extension into an isolated Edge/Chromium profile and checks worker/content messaging, real origin-private filesystem writes, cache skips without new media requests, missing-file recovery, reload persistence, and two-profile isolation. Its limit cases verify no extra page/media lookup after the cap, compatible reports, a lost failure acknowledgement followed by Resume, and Stop during media lookup. Instagram modules are fixtures; neither suite accesses your personal browser profile or account. Set `REEL_SAVER_BROWSER` to a compatible unpacked-extension-capable Chromium executable if needed.
 
 Files:
 
@@ -210,6 +221,7 @@ reelnest/
       popup.js
     shared/
       core.js               Media validation, filenames, and download messages
+      download-limits.js    Shared limit validation and allowance calculation
   scripts/                  Development checks and browser tools
   tests/                    Automated tests and fixtures
   plans/                    Local design notes (ignored by Git)

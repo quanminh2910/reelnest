@@ -187,6 +187,20 @@ try {
     for (let count = 0; count < index; count++) await key('ArrowDown', 'ArrowDown', 40);
     await key('Enter', 'Enter', 13);
   }
+  async function setLimit(value) {
+    await click(query('[data-role=bulk-limit-mode]'));
+    await key('Home', 'Home', 36);
+    if (value !== null) await key('ArrowDown', 'ArrowDown', 40);
+    await key('Enter', 'Enter', 13);
+    if (value !== null) {
+      await click(query('[data-role=bulk-limit]'));
+      await page('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 });
+      await page('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 });
+      await page('Input.insertText', { text: String(value) });
+      await key('Tab', 'Tab', 9);
+    }
+    await waitFor(`!${query('[data-role=bulk-start]')}.disabled`, 'limit settings committed');
+  }
   await page('Page.navigate',{url:'https://www.instagram.com/example_creator/reels/'});
   await waitFor(`${launcher}`,'actual extension profile launcher');
   let workerSession;
@@ -298,6 +312,93 @@ try {
   assert.equal(index.profiles['12345'].folderName,'example_creator');
   assert.equal(index.profiles['67890'].folderName,'second_creator');
   console.log('PASS one selected library root isolates two profile folders and their persistent histories');
+
+  // Exercise the limit through the real installed content/worker protocol. A
+  // deliberate copy counts as new even though the profile already has history.
+  await page('Page.navigate',{url:'https://www.instagram.com/example_creator/reels/'});
+  await reconnectFixture('limited profile launcher');
+  await setLimit(1);
+  await click(query('[data-role=skip-existing]'));
+  assert.equal(await evaluate(`${query('[data-role=skip-existing]')}.checked`),false);
+  await isolated(`(() => {const create=URL.createObjectURL.bind(URL);URL.createObjectURL=blob=>{
+    if(blob.type==='application/json')blob.text().then(text=>{window.__isolatedFixture.report=JSON.parse(text);});return create(blob);};})()`);
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'one-save limit and lease release');
+  assert.equal(await isolated('window.__isolatedFixture.mediaTransfers'),1);
+  assert.equal(await mediaInfoCount(),1,'only the permitted Reel is resolved');
+  assert.deepEqual(await evaluate('window.__pageFixture.pages'),[null],'cap one does not fetch a second discovery page');
+  assert.equal((await mp4Files()).length,39,'one additional uniquely named copy is kept');
+  await click(query('[data-role=bulk-report]'));
+  for(let attempt=0;attempt<40&&!await isolated('!!window.__isolatedFixture.report');attempt++)await new Promise(resolve=>setTimeout(resolve,25));
+  const limitedReport=await isolated('window.__isolatedFixture.report');
+  assert.equal(limitedReport.version,1);
+  assert.equal(limitedReport.maxNewVideos,1);
+  assert.equal(limitedReport.committedNewSaves,1);
+  assert.equal(limitedReport.completionReason,'profile_limit_reached');
+  assert.equal(limitedReport.sourceExhausted,false);
+  assert.equal(limitedReport.counts.saved,1);
+  assert.equal(limitedReport.counts.deferred,11);
+  assert.equal(limitedReport.items.filter(item=>item.state==='deferred'&&item.reason==='profile_limit_reached').length,11);
+  assert.equal(limitedReport.items.some(item=>JSON.stringify(item).includes('secret=')),false);
+  console.log('PASS installed single-profile cap: one committed copy, no extra page/media request, compatible report and deferred overflow');
+
+  // Missing files remain eligible; cached pages must not consume the allowance.
+  await click(query('[data-role=skip-existing]'));
+  const historyAfterCopy=await isolated("window.__isolatedFixture.readJson('example_creator/.reel-saver-cache.json')");
+  const missing=Object.values(historyAfterCopy.saved).slice(-2).map(entry=>'example_creator/'+entry.relativePath);
+  for(const filename of missing)await isolated(`window.__isolatedFixture.removeFile(${JSON.stringify(filename)})`);
+  await evaluate('window.__pageFixture.pages=[];window.__pageFixture.info=[]');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'cached pages followed by one missing save');
+  assert.equal(await isolated('window.__isolatedFixture.mediaTransfers'),2,'cache hits do not consume the new-save allowance');
+  assert.equal(await mediaInfoCount(),1);
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),1);
+  assert.ok(Number(await evaluate(`${query('[data-count=alreadyDownloaded]')}.textContent`))>0);
+  console.log('PASS installed limited run scans cached entries and saves a missing video without exceeding its allowance');
+
+  await page('Page.reload');
+  await reconnectFixture('persisted limit after reload');
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit-mode]')}.value`),'custom');
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit]')}.value`),'1');
+
+  // Lose a negative writer acknowledgement once. The worker's prepared quota
+  // must be settled with the original attempt before another attempt starts.
+  await isolated(`(() => {
+    const state=window.__isolatedFixture,send=chrome.runtime.sendMessage.bind(chrome.runtime),fetchVideo=window.fetch;
+    state.failedAcknowledgements=0;state.failedTransfers=0;
+    chrome.runtime.sendMessage=async message=>{
+      if(message.type==='REEL_SAVER_BULK_ITEM_RESULT'&&message.result?.state==='failed'&&!state.failedAcknowledgements++)throw new Error('Fixture lost failed-save acknowledgement');
+      return send(message);
+    };
+    window.fetch=async(...args)=>{if(!state.failedTransfers++)throw new TypeError('Fixture video transfer failed before writing');return fetchVideo(...args);};
+  })()`);
+  const filesBeforeFailure=await mp4Files();
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-start]')}.textContent==='Resume' && !${query('[data-role=bulk-start]')}.disabled`,'lost negative acknowledgement pauses safely');
+  assert.deepEqual(await mp4Files(),filesBeforeFailure,'failed transfer creates no additional file');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Limit reached') && !${query('[data-role=bulk-start]')}.disabled`,'original negative receipt settles before retry');
+  assert.equal(await isolated('window.__isolatedFixture.mediaTransfers'),1,'only the successful retry writes a video');
+  assert.equal((await mp4Files()).length,filesBeforeFailure.length+1);
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),1);
+  console.log('PASS real worker reservation survives a lost failure acknowledgement and Resume settles it before one successful retry');
+
+  // Stop while MAIN-world media lookup is pending, before a native file writer
+  // starts. The eventual prepared response must receive a no-output receipt.
+  await click(query('[data-role=skip-existing]'));
+  await evaluate(`(() => {const api=require('PolarisInstapi'),get=api.apiGet;api.apiGet=async address=>{
+    if(/media\\//.test(address))await new Promise(resolve=>{window.__pageFixture.releaseResolve=resolve;});return get(address);};})()`);
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`typeof window.__pageFixture.releaseResolve==='function'`,'held native resolution');
+  await click(query('[data-role=bulk-stop]'));
+  await evaluate('window.__pageFixture.releaseResolve()');
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Stopped.') && !${query('[data-role=bulk-start]')}.disabled && ${query('[data-role=bulk-stop]')}.hidden`,'Stop acknowledges no-output prepared response and releases ownership');
+  assert.equal(await isolated('window.__isolatedFixture.mediaTransfers'),1,'Stop during lookup never starts another file transfer');
+  assert.equal(Number(await evaluate(`${query('[data-count=saved]')}.textContent`)),0);
+  console.log('PASS installed Stop during native lookup records no output and releases the reserved allowance');
+  await setLimit(null);
+  assert.equal(await evaluate(`${query('[data-role=bulk-limit-mode]')}.value`),'unlimited');
+  console.log('PASS custom limit persists as a preference and can return to Unlimited');
   const artifacts=path.join(root,'artifacts');await mkdir(artifacts,{recursive:true});
   const capture=await page('Page.captureScreenshot',{format:'png'});
   await writeFile(path.join(artifacts,'bulk-extension-preview.png'),Buffer.from(capture.data,'base64'));

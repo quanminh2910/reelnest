@@ -110,8 +110,9 @@ async function load(f) {
 
 function message(action, extra = {}) { return { type: `REEL_SAVER_BULK_${action}`, ...extra }; }
 const options = (destination = "downloads") => ({ mode: "batches", batchSize: 35, destination });
-async function start(api, source = sender(), destination = "downloads") {
-  const result = await api.handleBulkMessage(message("START", { options: options(destination) }), source);
+async function start(api, source = sender(), destination = "downloads", maxNewVideos) {
+  const result = await api.handleBulkMessage(message("START", { options: { ...options(destination),
+    ...(maxNewVideos !== undefined ? { maxNewVideos } : {}) } }), source);
   assert.equal(result.ok, true, JSON.stringify(result));
   return result.job;
 }
@@ -132,7 +133,7 @@ async function waitUntil(predicate) {
 test("bulk settings default to 35 and validate mode and bounded integer size", async () => {
   const f = fixture(); const api = await load(f);
   assert.deepEqual(await api.handleBulkMessage(message("SETTINGS_GET"), sender()), {
-    ok: true, settings: { mode: "batches", batchSize: 35 },
+    ok: true, settings: { mode: "batches", batchSize: 35, maxNewVideos: null },
   });
   const stored = await api.handleBulkMessage(message("SETTINGS_SET", { settings: { mode: "scan_all", batchSize: 50 } }), sender());
   assert.equal(stored.settings.mode, "scan_all");
@@ -586,4 +587,324 @@ test("cleanup queued behind a refreshed Start cannot interrupt the newly registe
   assert.equal(f.state.session[activeKey].documentId, "document-two");
   assert.equal(f.state.session[activeKey].active, true);
   assert.equal(f.state.tabs.get(7).autoDiscardable, false);
+});
+
+test("save limits validate settings and starts, persist defaults, and freeze the active run", async () => {
+  const f = fixture(); const api = await load(f);
+  for (const maxNewVideos of [null, 1, 50000]) {
+    const response = await api.handleBulkMessage(message("SETTINGS_SET", { settings: { ...options(), maxNewVideos } }), sender());
+    assert.equal(response.ok, true);
+    assert.equal(response.settings.maxNewVideos, maxNewVideos);
+    assert.equal((await api.handleBulkMessage(message("SETTINGS_GET"), sender())).settings.maxNewVideos, maxNewVideos);
+  }
+  for (const maxNewVideos of [0, -1, 50001, 1.5, "1", "", NaN, Infinity]) {
+    for (const action of ["SETTINGS_SET", "START"]) {
+      const result = await api.handleBulkMessage(message(action, {
+        [action === "START" ? "options" : "settings"]: { ...options(), maxNewVideos },
+      }), sender());
+      assert.equal(result.error.code, "INVALID_LIMIT");
+    }
+  }
+  const job = await start(api, sender(), "folder", 1);
+  assert.equal(job.options.maxNewVideos, 1);
+  await api.handleBulkMessage(message("SETTINGS_SET", { settings: { ...options(), maxNewVideos: 100 } }), sender());
+  assert.equal(f.state.session[activeKey].options.maxNewVideos, 1, "preferences never change a running allowance");
+});
+
+test("legacy or corrupt saved limit preferences read as unlimited", async () => {
+  const f = fixture(); const api = await load(f);
+  for (const pref of [{ mode: "batches", batchSize: 35 }, { maxNewVideos: "20" }, { maxNewVideos: 50001 }]) {
+    f.state.local["reel-saver:bulk-prefs"] = pref;
+    assert.equal((await api.handleBulkMessage(message("SETTINGS_GET"), sender())).settings.maxNewVideos, null);
+  }
+  const job = await start(api);
+  assert.equal(job.options.maxNewVideos, null);
+});
+
+test("native saves reserve the allowance, count once across restart, and block lookups after the cap", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.session[activeKey].reservationMediaId, "1");
+  const before = f.state.sourceCalls.length;
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "two", { item: secondItem }), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal(f.state.sourceCalls.length, before);
+  const receipt = operation("ITEM_RESULT", job, "attempt-one", { result: { state: "saved", filename: "creator_B.mp4", bytesWritten: 2048 } });
+  assert.equal((await api.handleBulkMessage(receipt, sender())).ok, true);
+  api = await load(f);
+  assert.equal((await api.handleBulkMessage(receipt, sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "two", { item: secondItem }), sender())).error.code, "PROFILE_LIMIT_REACHED");
+  assert.equal(f.state.sourceCalls.length, before);
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "repeat"), sender())).alreadySaved, true);
+  await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "completed" }), sender());
+  assert.equal((await api.handleBulkMessage(message("REOPEN", { jobId: job.jobId }), sender())).error.code, "PROFILE_LIMIT_REACHED");
+  const next = await start(api, sender(), "folder", 1);
+  assert.notEqual(next.jobId, job.jobId);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0, "a deliberate new run has a new allowance");
+});
+
+test("reaching the save cap never dispatches another discovery request", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  f.state.source = () => ({ ok: true, profile, page: { items: [item, secondItem], nextCursor: "NEXT", hasMore: true } });
+  await discover(api, job);
+  delete f.state.source;
+  await api.handleBulkMessage(operation("RESOLVE", job), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "saved", filename: "creator_B.mp4", bytesWritten: 2048 } }), sender());
+  const before = f.state.sourceCalls.length;
+  assert.equal((await discover(api, job, sender(), "NEXT")).error.code, "PROFILE_LIMIT_REACHED");
+  assert.equal(f.state.sourceCalls.length, before);
+  assert.equal(f.state.session[activeKey].exhausted, false);
+});
+
+test("failed and unavailable native items release their reservation without consuming the cap", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  f.state.source = () => ({ ok: false, error: { code: "MEDIA_UNAVAILABLE", message: "Unavailable" } });
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job), sender())).error.code, "MEDIA_UNAVAILABLE");
+  delete f.state.source;
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  await api.handleBulkMessage(operation("RESOLVE", job, "two", { item: secondItem }), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "two", { item: secondItem, result: { state: "failed", error: { message: "Network failed" } } }), sender());
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "retry", { item: secondItem }), sender())).ok, true);
+});
+
+test("an unrecorded native receipt holds the last slot until its acknowledgement is replayed", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("RESOLVE", job), sender());
+  const receipt = operation("ITEM_RESULT", job, "attempt-one", { result: { state: "saved", filename: "creator_B.mp4", bytesWritten: 2048 } });
+  f.state.failSessionWrite = true;
+  assert.equal((await api.handleBulkMessage(receipt, sender())).error.code, "STORAGE_FAILED");
+  api = await load(f);
+  const before = f.state.sourceCalls.length;
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "two", { item: secondItem }), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "retry"), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal(f.state.sourceCalls.length, before);
+  assert.equal((await api.handleBulkMessage(receipt, sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+});
+
+test("uncertain native cleanup blocks release, another item, and another attempt until confirmed", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("RESOLVE", job), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "failed", error: { message: "Removal failed", cleanupFailed: true } } }), sender());
+  assert.equal(f.state.session[operationKey(job.jobId)].state, "unknown");
+  assert.equal(f.state.session[activeKey].reservationMediaId, "1");
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "retry"), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal((await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "stopped" }), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal(f.state.session[activeKey].active, true);
+  assert.equal((await api.handleBulkMessage(message("START", { options: options() }), sender(8))).error.code, "RECONCILIATION_REQUIRED");
+  assert.ok(f.state.session[operationKey(job.jobId)]);
+  // The original writer can confirm cleanup without starting another transfer.
+  assert.equal((await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "canceled" } }), sender())).ok, true);
+  assert.equal((await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "stopped" }), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+});
+
+test("native unresolved reservations survive tab cleanup and cannot be erased by another document", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("RESOLVE", job), sender());
+  await api.cleanupBulkTab(7);
+  const before = structuredClone(f.state.session);
+  const blocked = await api.handleBulkMessage(message("START", { options: options() }), sender(7, "document-two"));
+  assert.equal(blocked.error.code, "RECONCILIATION_REQUIRED");
+  assert.match(blocked.error.message, /chrome:\/\/extensions/);
+  assert.match(blocked.error.message, /refresh Instagram/);
+  assert.deepEqual(f.state.session, before);
+});
+
+test("browser saves commit once on completion and block the next download after worker restart", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  f.state.downloads[0].state = "complete"; f.state.downloads[0].fileSize = 2048;
+  api = await load(f);
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).download.state, "complete");
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).ok, true);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  const before = f.state.sourceCalls.length;
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job, "two", { item: secondItem }), sender())).error.code, "PROFILE_LIMIT_REACHED");
+  assert.equal(f.state.downloads.length, 1);
+  assert.equal(f.state.sourceCalls.length, before);
+});
+
+test("a rejected browser download releases its slot and a later successful retry consumes one", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job); f.state.downloadError = true;
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job), sender())).error.code, "DOWNLOAD_FAILED");
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  delete f.state.downloadError;
+  await api.handleBulkMessage(operation("DOWNLOAD", job, "retry"), sender());
+  f.state.downloads[0].state = "complete";
+  await api.handleBulkMessage(operation("STATUS", job, "retry"), sender());
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.downloads.length, 1);
+});
+
+test("uncertain Chrome acceptance reserves allowance across restart until reconciliation", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job); f.state.failAcceptanceRecord = true;
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job), sender())).error.code, "RECONCILE_REQUIRED");
+  api = await load(f);
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job, "two", { item: secondItem }), sender())).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal(f.state.calls.filter(value => value.type === "download").length, 1);
+  f.state.downloads[0].state = "complete";
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job, "retry"), sender())).download.state, "complete");
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+});
+
+test("concurrent native requests cannot reserve the last slot twice", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  const results = await Promise.all([item, secondItem].map((entry, index) => api.handleBulkMessage(operation("RESOLVE", job, `attempt-${index}`, { item: entry }), sender())));
+  assert.equal(results.filter(result => result.ok).length, 1);
+  assert.equal(results.filter(result => result.error?.code === "RECONCILIATION_REQUIRED").length, 1);
+  assert.equal(f.state.sourceCalls.filter(request => request.action === "resolve").length, 1);
+});
+
+test("Stop counts a browser save that completed before cancellation and returns a physical receipt", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  f.state.downloads[0].state = "complete"; f.state.downloads[0].fileSize = 2048;
+  api = await load(f);
+  const stopped = await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "stopped" }), sender());
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.committedNewSaves, 1);
+  assert.deepEqual(stopped.savedResults, [{ mediaId: "1", filename: "creator_B.mp4", downloadId: 1, bytesWritten: 2048 }]);
+  assert.equal(f.state.session[activeKey].active, false);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  const again = await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "stopped" }), sender());
+  assert.equal(again.committedNewSaves, 1);
+});
+
+test("cancellation that leaves Chrome running keeps ownership and the allowance reserved", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  f.chrome.downloads.cancel = async () => { throw new Error("Chrome unavailable"); };
+  assert.equal((await api.handleBulkMessage(operation("CANCEL_ITEM", job), sender())).error.code, "RECONCILE_REQUIRED");
+  assert.equal((await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "stopped" }), sender())).error.code, "RECONCILE_REQUIRED");
+  assert.equal(f.state.session[activeKey].active, true);
+  assert.equal(f.state.session[activeKey].reservationMediaId, "1");
+  assert.equal((await api.handleBulkMessage(message("START", { options: options() }), sender(8))).error.code, "RECONCILIATION_REQUIRED");
+  f.state.downloads[0].state = "complete";
+  assert.equal((await api.handleBulkMessage(operation("STATUS", job), sender())).download.state, "complete");
+  assert.equal((await api.handleBulkMessage(message("END", { jobId: job.jobId, state: "stopped" }), sender())).ok, true);
+});
+
+test("a completed native receipt is immutable against duplicate or late failure acknowledgements", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("RESOLVE", job), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "saved", filename: "creator_B.mp4", bytesWritten: 2048 } }), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "failed" } }), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "saved", filename: "different.mp4", bytesWritten: 4096 } }), sender());
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[operationKey(job.jobId)].state, "saved");
+  assert.equal(f.state.session[operationKey(job.jobId)].filename, "creator_B.mp4");
+  assert.equal(f.state.session[operationKey(job.jobId)].bytesWritten, 2048);
+});
+
+test("a negative host receipt fences a late resolve response before another native write can be prepared", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job); f.state.resolveGate = deferred();
+  const resolving = api.handleBulkMessage(operation("RESOLVE", job), sender());
+  await waitUntil(() => f.state.sourceCalls.some(request => request.action === "resolve"));
+  const negative = await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", {
+    result: { state: "canceled", error: { message: "Host never started a file write" } },
+  }), sender());
+  assert.equal(negative.ok, true);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  f.state.resolveGate.resolve();
+  assert.equal((await resolving).error.code, "SAVE_CANCELLED");
+  assert.equal(f.state.session[operationKey(job.jobId)].state, "canceled");
+  assert.equal(f.state.session[operationKey(job.jobId)].quotaState, "released");
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "retry"), sender())).ok, true);
+});
+
+test("a released attempt cannot commit a late saved receipt or erase another video's reservation", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 2);
+  await discover(api, job);
+  await api.handleBulkMessage(operation("RESOLVE", job), sender());
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "failed" } }), sender());
+  await api.handleBulkMessage(operation("RESOLVE", job, "two", { item: secondItem }), sender());
+  const invalidLateSave = await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", {
+    result: { state: "saved", filename: "unexpected.mp4", bytesWritten: 2048 },
+  }), sender());
+  assert.equal(invalidLateSave.error.code, "STALE_OPERATION");
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", { result: { state: "canceled" } }), sender());
+  assert.equal(f.state.session[activeKey].reservationMediaId, "2");
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(f.state.session[operationKey(job.jobId)].state, "failed");
+  await api.handleBulkMessage(operation("ITEM_RESULT", job, "two", { item: secondItem,
+    result: { state: "saved", filename: "creator_C.mp4", bytesWritten: 2048 } }), sender());
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+});
+
+test("a reservation claimed during refreshed-document identification prevents replacing the old journal", async () => {
+  const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+  await discover(api, job);
+  const identifying = deferred(); const finishIdentify = deferred();
+  f.state.source = async request => {
+    if (request.action === "identify") {
+      identifying.resolve();
+      await finishIdentify.promise;
+      return { ok: true, profile };
+    }
+    return { ok: true, profile, media: { mediaId: item.mediaId, shortcode: item.shortcode,
+      pageUrl: "https://www.instagram.com/reel/B/", username: "creator", url: "https://scontent.cdninstagram.com/video/reel.mp4" } };
+  };
+  const replacement = api.handleBulkMessage(message("START", { options: options("folder") }), sender(7, "document-two"));
+  await identifying.promise;
+  assert.equal((await api.handleBulkMessage(operation("RESOLVE", job), sender())).ok, true);
+  finishIdentify.resolve();
+  assert.equal((await replacement).error.code, "RECONCILIATION_REQUIRED");
+  assert.equal(f.state.session[activeKey].jobId, job.jobId);
+  assert.equal(f.state.session[activeKey].reservationMediaId, "1");
+  assert.equal(f.state.session[operationKey(job.jobId)].state, "prepared");
+});
+
+test("a no-output acknowledgement before registration fences a delayed resolve and only its exact attempt", async () => {
+  for (const delayedRead of [1, 2]) {
+    const f = fixture(); const api = await load(f); const job = await start(api, sender(), "folder", 1);
+    await discover(api, job);
+    const reading = deferred(); const finishRead = deferred();
+    const originalGet = f.chrome.storage.session.get;
+    let operationReads = 0;
+    f.chrome.storage.session.get = async key => {
+      if (key === operationKey(job.jobId) && ++operationReads === delayedRead) {
+        reading.resolve();
+        await finishRead.promise;
+      }
+      return originalGet(key);
+    };
+    const resolving = api.handleBulkMessage(operation("RESOLVE", job), sender());
+    await reading.promise;
+    const negative = await api.handleBulkMessage(operation("ITEM_RESULT", job, "attempt-one", {
+      result: { state: "canceled", error: { message: "No host writer was started" } },
+    }), sender());
+    assert.equal(negative.error.code, "STALE_OPERATION", "an absent journal remains an unregistered result");
+    finishRead.resolve();
+    assert.equal((await resolving).error.code, "SAVE_CANCELLED");
+    assert.equal(f.state.session[operationKey(job.jobId)], undefined);
+    assert.equal(f.state.session[activeKey].reservationMediaId, null);
+    assert.equal(f.state.sourceCalls.filter(request => request.action === "resolve").length, 0);
+    assert.equal((await api.handleBulkMessage(operation("RESOLVE", job, "new-attempt"), sender())).ok, true,
+      "a different attempt can use the unconsumed allowance");
+  }
 });

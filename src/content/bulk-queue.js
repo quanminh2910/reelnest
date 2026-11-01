@@ -3,6 +3,7 @@
 (() => {
   'use strict';
   if (globalThis.ReelSaverBulkQueue) return;
+  const limits = globalThis.ReelSaverDownloadLimits;
   let serial = 0;
   const terminals = new Set(['completed', 'completed_with_errors', 'stopped']);
   const pauseCodes = new Set([
@@ -16,6 +17,7 @@
     'SCHEMA_CHANGED', 'SCHEMA_ERROR', 'ADAPTER_UNAVAILABLE', 'UNSUPPORTED_SOURCE',
     'RECONCILE_REQUIRED', 'STORAGE_FAILED', 'STALE_JOB', 'STALE_OPERATION',
     'ADAPTER_ERROR', 'PROFILE_UNAVAILABLE', 'MEDIA_MISMATCH', 'INVALID_ITEM', 'FILE_FAILED',
+    'PROFILE_LIMIT_REACHED',
   ]);
   const skipCodes = new Set(['MEDIA_UNAVAILABLE', 'MEDIA_NOT_FOUND', 'NOT_FOUND', 'DELETED', 'NO_MP4']);
   const transientCodes = new Set(['NETWORK_FAILED', 'NETWORK_TIMEOUT', 'NETWORK_DISCONNECTED', 'TRANSFER_TIMEOUT', 'LOOKUP_TIMEOUT', 'SERVER_ERROR', 'VIDEO_REQUEST_FAILED', 'SERVER_FORBIDDEN', 'SERVER_UNAUTHORIZED']);
@@ -42,7 +44,8 @@
     if (options.jobId !== undefined && (typeof options.jobId !== 'string' || !/^[A-Za-z0-9_-]{1,160}$/.test(options.jobId))) {
       throw problem('INVALID_OPTIONS', 'The bulk job identifier is invalid.', 'start');
     }
-    return { profile: { id: String(profile.id), username: profile.username }, mode, batchSize,
+    const maxNewVideos = limits.normalize(options.maxNewVideos);
+    return { profile: { id: String(profile.id), username: profile.username }, mode, batchSize, maxNewVideos,
       ...(options.jobId ? { jobId: options.jobId } : {}) };
   }
 
@@ -131,7 +134,7 @@
     let pending = [];
     let records = new Map();
     let order = [];
-    let counters = { saved: 0, alreadyDownloaded: 0, failed: 0, skipped: 0, queued: 0, canceled: 0 };
+    let counters = { saved: 0, alreadyDownloaded: 0, failed: 0, skipped: 0, queued: 0, canceled: 0, deferred: 0 };
     let seenCursors = new Set();
     let noProgressPages = 0;
     let consecutiveFailures = 0;
@@ -148,6 +151,9 @@
     let startedAt = null;
     let endedAt = null;
     let lastProgressAt = 0;
+    let completionReason = null;
+
+    const remainingAllowance = () => limits.remaining(options?.maxNewVideos, counters.saved);
 
     function update(id, patch) {
       const previous = records.get(id);
@@ -165,6 +171,7 @@
       return {
         jobId: options?.jobId || null, profile: options ? { ...options.profile } : null,
         mode: options?.mode || 'batches', batchSize: options?.batchSize || 35,
+        maxNewVideos: options?.maxNewVideos ?? null, committedNewSaves: counters.saved, completionReason,
         state, phase, batchNumber, sourceExhausted: exhausted, cursor,
         counts: { discovered: records.size, ...counters },
         active: active ? { mediaId: active.mediaId, shortcode: active.shortcode,
@@ -205,14 +212,22 @@
       activeId = null;
       operation = null;
       state = 'stopped';
+      completionReason = 'user_stopped';
       endedAt = now();
       pauseRequested = false;
       emit();
     }
 
-    function finishCompleted() {
+    function finishCompleted(reason = 'feed_exhausted') {
+      if (reason === 'profile_limit_reached') {
+        for (const [id, item] of records) {
+          if (item.state === 'queued') update(id, { state: 'deferred', reason, progress: undefined });
+        }
+        pending = []; batch = []; offset = 0;
+      }
       activeId = null;
       state = counters.failed ? 'completed_with_errors' : 'completed';
+      completionReason = reason;
       endedAt = now();
       error = null;
       pauseReason = null;
@@ -447,11 +462,15 @@
     async function pump(expectedGeneration) {
       while (expectedGeneration === generation && ['running', 'pausing', 'stopping'].includes(state)) {
         if (stopRequested) { finishStopped(); return; }
+        // Check before discovery as well as before the next physical save. A
+        // returned page may include overflow, but no new work starts at the cap.
+        if (remainingAllowance() === 0) { finishCompleted('profile_limit_reached'); return; }
         if (exhausted && counters.queued === 0 && activeId === null) { finishCompleted(); return; }
         if (pauseAtBoundary()) return;
         if (phase === 'discovering') {
           const fullScan = options.mode === 'scan_all' && !approved;
-          if (!exhausted && (fullScan || pending.length < options.batchSize)) {
+          const target = Math.min(options.batchSize, remainingAllowance());
+          if (!exhausted && (fullScan || pending.length < target)) {
             if (!await discover(expectedGeneration)) {
               if (stopRequested) finishStopped();
               return;
@@ -459,7 +478,9 @@
             continue;
           }
           if (fullScan && exhausted && records.size) {
-            phase = 'ready'; state = 'paused'; pauseReason = 'Ready to download all discovered Reels.';
+            phase = 'ready'; state = 'paused';
+            pauseReason = options.maxNewVideos === null ? 'Ready to download all discovered Reels.'
+              : `Ready to save up to ${options.maxNewVideos} new videos from the discovered Reels.`;
             emit(); return;
           }
           if (!pending.length && exhausted) { finishCompleted(); return; }
@@ -469,7 +490,7 @@
           if (offset >= batch.length) {
             batch = []; offset = 0;
             if (pending.length) {
-              batch = pending.splice(0, options.batchSize);
+              batch = pending.splice(0, Math.min(options.batchSize, remainingAllowance()));
               batchNumber++;
               emit();
             } else if (exhausted) { finishCompleted(); return; }
@@ -510,10 +531,11 @@
       options = { ...valid, jobId: valid.jobId || `bulk-${now()}-${++serial}` };
       state = 'running'; phase = 'discovering'; cursor = null; exhausted = false;
       batchNumber = 0; batch = []; offset = 0; pending = []; records = new Map(); order = [];
-      counters = { saved: 0, alreadyDownloaded: 0, failed: 0, skipped: 0, queued: 0, canceled: 0 };
+      counters = { saved: 0, alreadyDownloaded: 0, failed: 0, skipped: 0, queued: 0, canceled: 0, deferred: 0 };
       seenCursors = new Set(); noProgressPages = 0; consecutiveFailures = 0; activeId = null; operation = null;
       pauseRequested = false; stopRequested = false; approved = false;
       error = null; pauseReason = null; retryAt = 0; startedAt = now(); endedAt = null;
+      completionReason = null;
       emit(); launch(); return snapshot();
     }
 
@@ -547,6 +569,9 @@
     }
 
     function retryFailed() {
+      if (options && remainingAllowance() === 0) {
+        throw problem('LIMIT_REACHED', 'The download limit was reached. Start a new run to download more videos.', 'retry');
+      }
       if (pumping || state !== 'completed_with_errors') {
         throw problem('JOB_BUSY', 'Retry failed items after the current full-profile pass finishes.', 'retry');
       }
@@ -555,22 +580,38 @@
       for (const id of failed) update(id, { state: 'queued', error: undefined });
       pending = failed; batch = []; offset = 0; approved = true;
       state = 'running'; phase = 'downloading'; endedAt = null;
+      completionReason = null;
       pauseRequested = false; stopRequested = false; error = null; pauseReason = null;
       consecutiveFailures = 0;
       emit(); launch(); return snapshot();
     }
 
     // The adapter may finish a physical save while Stop is settling. Record its
-    // durable receipt without restarting discovery or scheduling another file.
+    // confirmed receipt without restarting discovery or scheduling another file.
     function recordSaved(mediaId, result) {
       if (!terminals.has(state)) throw problem('JOB_BUSY', 'Settle physical receipts after the queue stops.', 'cache');
       const previous = records.get(mediaId);
-      if (!previous || !result || typeof result.filename !== 'string' || !result.filename ||
-          !Number.isSafeInteger(result.bytesWritten) || result.bytesWritten <= 0 || result.cacheHit) {
+      const browserReceipt = Number.isInteger(result?.downloadId) && result.downloadId >= 0;
+      const confirmedBytes = Number.isSafeInteger(result?.bytesWritten) && result.bytesWritten > 0;
+      if (!previous || previous.attempts < 1 || previous.state === 'already_downloaded' ||
+          !result || typeof result.filename !== 'string' || !result.filename ||
+          (result.downloadId !== undefined && !browserReceipt) ||
+          (!confirmedBytes && (!browserReceipt || result.bytesWritten !== undefined)) || result.cacheHit) {
         throw problem('INVALID_RESULT', 'A known physical-save receipt is required.', 'cache');
       }
-      update(mediaId, { state: 'saved', result: { filename: result.filename, bytesWritten: result.bytesWritten },
-        filename: result.filename, bytesWritten: result.bytesWritten, error: undefined });
+      if (previous.state === 'saved' && (previous.filename !== result.filename ||
+          previous.downloadId !== result.downloadId ||
+          confirmedBytes && previous.bytesWritten !== undefined && previous.bytesWritten !== result.bytesWritten)) {
+        throw problem('INVALID_RESULT', 'The repeated receipt does not match the recorded file.', 'cache');
+      }
+      if (previous.state !== 'saved' && remainingAllowance() === 0) {
+        throw problem('PROFILE_LIMIT_REACHED', 'The recorded receipt exceeds this run’s download limit. Check the destination before starting another run.', 'cache');
+      }
+      const saved = { filename: result.filename,
+        ...(browserReceipt ? { downloadId: result.downloadId } : {}),
+        ...(confirmedBytes ? { bytesWritten: result.bytesWritten }
+          : previous.bytesWritten !== undefined ? { bytesWritten: previous.bytesWritten } : {}) };
+      update(mediaId, { state: 'saved', result: saved, ...saved, error: undefined });
       if (/^CACHE_/.test(error?.code || '') || error?.code === 'RECONCILIATION_REQUIRED') {
         error = null;
         pauseReason = null;

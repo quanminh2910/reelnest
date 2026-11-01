@@ -14,13 +14,16 @@
     };
     return {
       version: 1, jobId: snapshot.jobId, profile: snapshot.profile, mode: snapshot.mode, batchSize: snapshot.batchSize,
+      maxNewVideos: snapshot.maxNewVideos ?? null, committedNewSaves: snapshot.committedNewSaves ?? snapshot.counts.saved,
+      ...(snapshot.completionReason ? { completionReason: snapshot.completionReason } : {}),
       state: snapshot.state, sourceExhausted: snapshot.sourceExhausted, startedAt: snapshot.startedAt, endedAt: snapshot.endedAt,
       phase: snapshot.phase,
       ...(snapshot.error ? { error: reportError(snapshot.error) } : {}),
       counts: snapshot.counts,
       items: snapshot.items.map(item => ({ mediaId: item.mediaId, shortcode: item.shortcode, state: item.state,
         attempts: item.attempts, filename: String(item.result?.filename || item.filename || "").replaceAll("\\", "/").split("/").pop(),
-        ...(item.state === "already_downloaded" ? { reason: "already_downloaded" } : {}),
+        ...(item.state === "already_downloaded" ? { reason: "already_downloaded" } :
+          item.reason === "profile_limit_reached" ? { reason: "profile_limit_reached" } : {}),
         ...((item.bytesWritten ?? item.result?.bytesWritten) !== undefined ? { bytesWritten: item.bytesWritten ?? item.result.bytesWritten } : {}),
         ...(item.error ? { error: reportError(item.error) } : {}) })),
     };
@@ -39,6 +42,8 @@
     const M = "REEL_SAVER_BULK_";
     let modeValue = "batches";
     let batchValue = 35;
+    let limitModeValue = "unlimited";
+    let limitInputValue = "";
     let settingsReady = false;
     let preferencesBusy = false;
     let starting = false;
@@ -59,10 +64,12 @@
     let clearingHistory = false;
     let clearContext = null;
     const nativeReceipts = new Map();
+    const failedNativeReceipts = new Map();
 
     const section = make("section", "", { class: "bulk", "data-role": "bulk-section" });
     const heading = make("div", "", { class: "section-heading" });
-    heading.append(make("h3", "Profile downloads"), make("span", "ALL REELS", { class: "badge" }));
+    const scopeBadge = make("span", "ALL REELS", { class: "badge" });
+    heading.append(make("h3", "Profile downloads"), scopeBadge);
     const modeLabel = make("label", "Download mode", { for: "reel-saver-bulk-mode" });
     const mode = make("select", "", { id: "reel-saver-bulk-mode", "data-role": "bulk-mode" });
     mode.append(make("option", "Download in batches", { value: "batches" }), make("option", "Scan all first", { value: "scan_all" }));
@@ -70,6 +77,16 @@
     const batchLabel = make("label", "Reels per batch", { for: "reel-saver-bulk-size" });
     const batch = make("input", "", { type: "number", min: "1", max: "500", step: "1", value: "35", id: "reel-saver-bulk-size", "data-role": "bulk-size", inputmode: "numeric" });
     batchRow.append(batchLabel, batch);
+    const limitLabel = make("label", "New videos per run", { for: "reel-saver-bulk-limit-mode" });
+    const limitMode = make("select", "", { id: "reel-saver-bulk-limit-mode", "data-role": "bulk-limit-mode" });
+    limitMode.append(make("option", "Unlimited", { value: "unlimited" }), make("option", "Custom limit", { value: "custom" }));
+    const limitRow = make("div", "", { class: "bulk-batch-row", hidden: "" });
+    const limitNumberLabel = make("label", "Maximum new videos", { for: "reel-saver-bulk-limit" });
+    const limitInput = make("input", "", { type: "text", inputmode: "numeric", pattern: "[0-9]*",
+      id: "reel-saver-bulk-limit", "data-role": "bulk-limit", "aria-describedby": "reel-saver-bulk-limit-help", autocomplete: "off" });
+    limitRow.append(limitNumberLabel, limitInput);
+    const limitHint = make("p", "Counts successful saves in this run. Already saved videos and failed downloads do not use the limit.",
+      { class: "hint", id: "reel-saver-bulk-limit-help", "data-role": "bulk-limit-hint" });
     const hint = make("p", "Find a batch, save its videos one at a time, then continue. Keep this Instagram tab open.", { class: "hint" });
     const summary = make("div", "", { class: "bulk-summary", "data-role": "bulk-summary" });
     const summaryCells = {};
@@ -104,7 +121,7 @@
     const clearCancel = make("button", "Cancel", { type: "button", "data-role": "cache-clear-cancel", hidden: "" });
     history.append(historyInfo, importButton, importFile, importSummary, importCommit, importCancel, clearButton, clearSummary, clearConfirm, clearCancel);
     const results = make("ul", "", { class: "activity bulk-results", "data-role": "bulk-results", "aria-label": "Recent bulk results" });
-    section.append(heading, modeLabel, mode, batchRow, hint, history, summary, message, progress, primary, secondary, results);
+    section.append(heading, modeLabel, mode, batchRow, limitLabel, limitMode, limitRow, limitHint, hint, history, summary, message, progress, primary, secondary, results);
     const styles = `
       .bulk{padding:16px;border:1px solid #d6e4da;border-radius:12px;background:#f0f7f2}
       .bulk-batch-row{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:11px}
@@ -142,13 +159,35 @@
       message.textContent = value;
       message.dataset.tone = tone;
     }
+    function selectedLimit() {
+      if (limitModeValue === "unlimited") return null;
+      if (!/^\d+$/.test(limitInputValue)) throw error("INVALID_LIMIT", "Enter a whole-number limit from 1 to 50,000, or choose Unlimited.");
+      return globalThis.ReelSaverDownloadLimits.normalize(Number(limitInputValue));
+    }
+    function limitReached(state = snapshot) {
+      return state?.maxNewVideos != null && (state.committedNewSaves ?? state.counts.saved) >= state.maxNewVideos;
+    }
     function update() {
       const active = busy();
       section.hidden = readRoute()?.type !== "profile" && !workerJob && !importContext && !importing && !clearContext && !clearingHistory;
       mode.value = modeValue;
       batch.value = String(batchValue);
-      mode.disabled = batch.disabled = !settingsReady || active || preferencesBusy || isSingleBusy();
+      limitMode.value = limitModeValue;
+      limitInput.value = limitInputValue;
+      mode.disabled = batch.disabled = limitMode.disabled = limitInput.disabled = !settingsReady || active || preferencesBusy || isSingleBusy();
       batchRow.hidden = modeValue !== "batches";
+      limitRow.hidden = limitModeValue !== "custom";
+      let configuredLimit = null;
+      let validLimit = true;
+      try { configuredLimit = selectedLimit(); } catch { validLimit = false; }
+      limitInput.setAttribute("aria-invalid", String(!validLimit));
+      scopeBadge.textContent = limitModeValue === "custom" ? "LIMITED" : "ALL REELS";
+      const countHelp = getDestination().kind === "folder"
+        ? "Already saved videos and failed downloads do not use the limit."
+        : "Failed downloads do not use the limit. Existing files in Browser Downloads are not checked.";
+      limitHint.textContent = snapshot && active && snapshot.maxNewVideos != null
+        ? `This run: ${snapshot.committedNewSaves ?? snapshot.counts.saved} of ${snapshot.maxNewVideos} new videos saved. ${countHelp}`
+        : `Counts successful saves in this run. ${countHelp}`;
       history.hidden = getDestination().kind !== "folder";
       importButton.disabled = active || isSingleBusy() || readRoute()?.type !== "profile";
       importCommit.hidden = importCancel.hidden = !importContext;
@@ -160,12 +199,15 @@
       clearConfirm.disabled = clearCancel.disabled = clearingHistory;
       hint.textContent = modeValue === "batches"
         ? "Find a batch, save its videos one at a time, then continue. Keep this Instagram tab open."
-        : "Find the full list first, then review the count and start downloading. Keep this tab open.";
+        : configuredLimit == null ? "Find the full list first, then review the count and start downloading. Keep this tab open."
+          : `Find the full list first, then save up to ${configuredLimit} new videos. The limit does not shorten the scan. Keep this tab open.`;
       const ready = snapshot?.state === "paused" && snapshot.phase === "ready";
       const recover = ["paused", "incomplete"].includes(snapshot?.state) && !ready;
       primary.hidden = active && !ready && !recover;
-      primary.textContent = ready ? `Download all ${snapshot.counts.discovered} Reels` : recover ? "Resume" : modeValue === "scan_all" ? "Scan all Reels" : "Download all Reels";
-      primary.disabled = !settingsReady || preferencesBusy || starting || importing || !!importContext || clearingHistory || !!clearContext || releasePending || releaseFailed || isSingleBusy() || readRoute()?.type !== "profile" || (hasJob() && !sameProfile()) || (!hasJob() && getDestination().kind === "ask");
+      const downloadLabel = value => value == null ? "Download all Reels" : `Download up to ${value} new Reels`;
+      primary.textContent = ready ? snapshot.maxNewVideos == null ? `Download all ${snapshot.counts.discovered} Reels` : downloadLabel(snapshot.maxNewVideos)
+        : recover ? "Resume" : modeValue === "scan_all" ? "Scan all Reels" : downloadLabel(configuredLimit);
+      primary.disabled = !settingsReady || !validLimit || preferencesBusy || starting || importing || !!importContext || clearingHistory || !!clearContext || releasePending || releaseFailed || isSingleBusy() || readRoute()?.type !== "profile" || (hasJob() && !sameProfile()) || (!hasJob() && getDestination().kind === "ask");
       pause.hidden = !["running", "pausing"].includes(snapshot?.state);
       pause.disabled = snapshot?.state === "pausing";
       pause.textContent = snapshot?.state === "pausing" ? "Pausing…" : "Pause";
@@ -173,7 +215,7 @@
       stop.disabled = releasePending || snapshot?.state === "stopping";
       stop.textContent = releasePending ? "Releasing…" : releaseFailed ? nativeReceipts.size ? "Record history and release" : "Release batch" : "Stop";
       retry.hidden = retryRetired || !(snapshot?.counts.failed > 0) || snapshot?.state !== "completed_with_errors";
-      retry.disabled = starting || importing || !!importContext || clearingHistory || !!clearContext || releasePending || releaseFailed || !sameProfile() || isSingleBusy();
+      retry.disabled = limitReached() || starting || importing || !!importContext || clearingHistory || !!clearContext || releasePending || releaseFailed || !sameProfile() || isSingleBusy();
       report.hidden = !snapshot;
       if (!workerJob && getDestination().kind === "ask") {
         setMessage("For bulk downloads, choose one folder or select Browser Downloads first.");
@@ -181,11 +223,14 @@
     }
 
     function describe(state) {
+      if (terminal.has(state.state) && state.completionReason === "profile_limit_reached") {
+        return `Limit reached · ${state.committedNewSaves ?? state.counts.saved} new videos saved.${state.counts.failed ? ` ${state.counts.failed} failed; start a new run to retry.` : ""}`;
+      }
       if (state.state === "completed") return `Completed. Saved ${state.counts.saved} Reels${state.counts.alreadyDownloaded ? `; already downloaded ${state.counts.alreadyDownloaded}` : ""}${state.counts.skipped ? `; skipped ${state.counts.skipped}` : ""}.`;
       if (state.state === "completed_with_errors") return `Finished with ${state.counts.failed} failed. Saved ${state.counts.saved} Reels. You can retry the failed items.`;
       if (state.state === "stopped") return `Stopped. ${state.counts.saved} saved videos were kept.`;
       if (state.state === "incomplete") return state.error?.message || "Scan incomplete. Resume to retry discovery; the end of this profile has not been confirmed.";
-      if (state.state === "paused") return state.phase === "ready" ? `${state.counts.discovered} Reels found. Review the destination, then download all.` : state.pauseReason || state.error?.message || "Paused. Resume when you are ready.";
+      if (state.state === "paused") return state.phase === "ready" ? `${state.counts.discovered} Reels found. Review the destination, then ${state.maxNewVideos == null ? "download all" : `save up to ${state.maxNewVideos} new videos`}.` : state.pauseReason || state.error?.message || "Paused. Resume when you are ready.";
       if (state.state === "pausing") return state.phase === "discovering" ? "Finishing this page, then pausing…" : "Finishing this video, then pausing…";
       if (state.state === "stopping") return "Stopping the active transfer…";
       if (state.phase === "discovering") return `Finding Reels${state.batchNumber ? ` for batch ${state.batchNumber}` : ""}… ${state.counts.discovered} found. The total is not known yet.`;
@@ -225,19 +270,32 @@
       update();
       onBusyChange();
       try {
+        for (const [key, receipt] of failedNativeReceipts) {
+          if (key.startsWith(`${workerJob.jobId}:`)) await settleFailedNativeReceipt(workerJob, receipt, key, jobDestination);
+        }
         for (const [key, receipt] of nativeReceipts) {
           if (key.startsWith(`${workerJob.jobId}:`)) {
             await settleNativeReceipt(workerJob, receipt.item, receipt, key, jobDestination);
             controller?.recordSaved(receipt.item.mediaId, receipt.result);
           }
         }
-        await request({ type: M + "END", jobId: workerJob.jobId, state: snapshot?.state || "stopped" });
+        const released = await request({ type: M + "END", jobId: workerJob.jobId, state: snapshot?.state || "stopped" });
+        if (jobDestination?.kind === "downloads") {
+          const recorded = new Map((snapshot?.items || []).map(item => [item.mediaId, item]));
+          for (const receipt of released.savedResults || []) {
+            const previous = recorded.get(receipt.mediaId);
+            if (previous?.state === "saved" && previous.filename === receipt.filename && previous.downloadId === receipt.downloadId &&
+                (receipt.bytesWritten === undefined || receipt.bytesWritten === previous.bytesWritten)) continue;
+            controller?.recordSaved(receipt.mediaId, receipt);
+          }
+        }
         jobDestination?.cache?.close();
         terminalNotified = true;
       } catch (cause) {
         releaseFailed = true;
         releaseError = nativeReceipts.size
           ? "A video is already saved. Its history or acknowledgement still needs recording; use Record history and release to retry without another download. Return to the original profile if you navigated away."
+          : failedNativeReceipts.size ? "The interrupted video's result or pending history still needs recording. Click Release batch to retry without writing another video."
           : `This batch could not be released. ${cause.message ? `${cause.message} ` : ""}Click Release batch to retry.`;
       } finally {
         releasePending = false;
@@ -287,6 +345,42 @@
       nativeReceipts.delete(receiptKey);
       return receipt.result;
     }
+    async function settleFailedNativeReceipt(job, receipt, receiptKey, target) {
+      let cleanupError;
+      if (receipt.needsAbandon) {
+        try {
+          await target.cache.abandonWrite(receipt.item);
+          receipt.needsAbandon = false;
+          if (receipt.cleanupFailed) {
+            // abandonWrite verifies that no pending output file remains.
+            receipt.cleanupFailed = false;
+            receipt.acknowledged = false;
+          }
+        } catch (cause) { cleanupError = cause; }
+      }
+      if (!receipt.acknowledged) {
+        try {
+          await request({ type: M + "ITEM_RESULT", jobId: job.jobId, mediaId: receipt.item.mediaId,
+            attemptId: receipt.attemptId, result: { state: receipt.state, error: { ...receipt.error,
+              ...(receipt.cleanupFailed ? { cleanupFailed: true, leftoverFilename: receipt.leftoverFilename } : {}) } } });
+        } catch (cause) {
+          // A rejected lookup may fail before any operation is registered. No
+          // file writer was invoked, and the original lookup error still wins.
+          if (!(receipt.beforeWriter && receipt.error.code && cause.code === "STALE_OPERATION")) {
+            throw error("RECONCILIATION_REQUIRED", "The interrupted video's result could not be recorded. Resume or Stop to retry its acknowledgement before downloading again.");
+          }
+        }
+        receipt.acknowledged = true;
+      }
+      if (cleanupError) throw error("CACHE_WRITE_FAILED", "The transfer stopped, but its pending history could not be updated. Resume or Stop to retry the history update before downloading again.", { stage: "cache" });
+      if (receipt.cleanupFailed) throw error("RECONCILIATION_REQUIRED", "Partial-file cleanup still needs confirmation. Check the destination, then retry releasing this batch.");
+      failedNativeReceipts.delete(receiptKey);
+    }
+    function failedNativeReceipt(item, attemptId, cause, signal, details = {}) {
+      return { item, attemptId, state: signal.aborted ? "canceled" : "failed", acknowledged: false,
+        cleanupFailed: cause.cleanupFailed === true, leftoverFilename: cause.leftoverFilename,
+        error: { code: cause.code || cause.name || "SAVE_FAILED", message: cause.message }, ...details };
+    }
     async function saveItem({ item, attemptId, signal, onProgress }) {
       const job = workerJob;
       const target = jobDestination;
@@ -296,31 +390,38 @@
         const receiptKey = `${job.jobId}:${item.mediaId}`;
         const receipt = nativeReceipts.get(receiptKey);
         if (receipt) return settleNativeReceipt(job, item, receipt, receiptKey, target);
+        const failedReceipt = failedNativeReceipts.get(receiptKey);
+        if (failedReceipt) await settleFailedNativeReceipt(job, failedReceipt, receiptKey, target);
+        if (signal.aborted) throw aborted();
         if (target.skipExisting) {
           const existing = await target.cache.verifyItem(item);
           if (signal.aborted) throw aborted();
           if (existing) return existing;
         }
-        const response = await request({ type: M + "RESOLVE", jobId: job.jobId, item, attemptId });
-        if (response.alreadySaved) return response.result;
-        if (signal.aborted) throw aborted();
+        let response;
+        try {
+          response = await request({ type: M + "RESOLVE", jobId: job.jobId, item, attemptId });
+          if (response.alreadySaved) return response.result;
+          if (signal.aborted) throw aborted();
+        } catch (cause) {
+          const failed = failedNativeReceipt(item, attemptId, cause, signal, { beforeWriter: true, needsAbandon: false });
+          failedNativeReceipts.set(receiptKey, failed);
+          await settleFailedNativeReceipt(job, failed, receiptKey, target);
+          throw cause;
+        }
         let saved;
-        let intentWritten = false;
+        let intentStarted = false;
         try {
           saved = await globalThis.ReelSaverFolderWriter.saveToFolder({ directoryHandle: target.handle, media: response.media, filename: response.filename, signal, onProgress,
             reservedNames: target.cache.reservedNamesFor(item),
             beforeCreate: async reservation => {
+              intentStarted = true;
               await target.cache.beginWrite(item, reservation);
-              intentWritten = true;
             } });
         } catch (cause) {
-          if (intentWritten && !cause.cleanupFailed) {
-            try { await target.cache.abandonWrite(item); }
-            catch { throw error("CACHE_WRITE_FAILED", "The transfer stopped, but its pending history could not be updated. Resume to reconcile it before downloading again.", { stage: "cache" }); }
-          }
-          await request({ type: M + "ITEM_RESULT", jobId: job.jobId, mediaId: item.mediaId, attemptId,
-            result: { state: signal.aborted ? "canceled" : "failed", error: { code: cause.code || cause.name || "SAVE_FAILED", message: cause.message,
-              ...(cause.cleanupFailed ? { cleanupFailed: true, leftoverFilename: cause.leftoverFilename } : {}) } } }).catch(() => {});
+          const failed = failedNativeReceipt(item, attemptId, cause, signal, { beforeWriter: false, needsAbandon: intentStarted });
+          failedNativeReceipts.set(receiptKey, failed);
+          await settleFailedNativeReceipt(job, failed, receiptKey, target);
           throw cause;
         }
         // Keep physical completion independently of its worker acknowledgement.
@@ -403,6 +504,9 @@
       const route = readRoute();
       const target = getDestination();
       if (route?.type !== "profile") return;
+      let maxNewVideos;
+      try { maxNewVideos = selectedLimit(); }
+      catch (cause) { setMessage(cause.message, "error"); update(); limitInput.focus(); return; }
       if (!["folder", "downloads"].includes(target.kind) || (target.kind === "folder" && !target.handle)) {
         setMessage("Choose a folder or select Browser Downloads before starting bulk downloads.", "error"); return;
       }
@@ -415,7 +519,7 @@
       let controllerStarted = false;
       try {
         if (workerJob && !terminalNotified) await request({ type: M + "END", jobId: workerJob.jobId, state: snapshot?.state || "stopped" });
-        const response = await request({ type: M + "START", options: { mode: modeValue, batchSize: batchValue, destination: target.kind } });
+        const response = await request({ type: M + "START", options: { mode: modeValue, batchSize: batchValue, destination: target.kind, maxNewVideos } });
         workerJob = response.job;
         registeredJob = workerJob;
         retryRetired = false;
@@ -427,6 +531,7 @@
         releaseFailed = false;
         releaseError = null;
         nativeReceipts.clear();
+        failedNativeReceipts.clear();
         if (target.kind === "folder") {
           if (!globalThis.ReelSaverProfileCache) throw error("CACHE_UNAVAILABLE", "Reload this Instagram tab to load library history.");
           const cache = await globalThis.ReelSaverProfileCache.openLibrary(target.handle, workerJob.profile);
@@ -434,7 +539,7 @@
           showLibrary(cache, jobDestination);
         }
         controller = buildController();
-        snapshot = controller.start({ jobId: workerJob.jobId, profile: workerJob.profile, mode: modeValue, batchSize: batchValue });
+        snapshot = controller.start({ jobId: workerJob.jobId, profile: workerJob.profile, mode: modeValue, batchSize: batchValue, maxNewVideos });
         controllerStarted = true;
         render();
       } catch (cause) {
@@ -632,7 +737,7 @@
       update();
       onBusyChange();
       try {
-        await request({ type: M + "SETTINGS_SET", settings: { mode: modeValue, batchSize: batchValue } });
+        await request({ type: M + "SETTINGS_SET", settings: { mode: modeValue, batchSize: batchValue, maxNewVideos: selectedLimit() } });
       } catch (cause) { setMessage(cause.message || "Download options could not be saved.", "error"); }
       finally { preferencesBusy = false; update(); onBusyChange(); }
     }
@@ -651,6 +756,28 @@
       batchValue = value;
       savePreferences();
     });
+    limitMode.addEventListener("change", event => {
+      if (!event.isTrusted || busy() || preferencesBusy || isSingleBusy()) { update(); return; }
+      if (!["unlimited", "custom"].includes(limitMode.value)) { update(); return; }
+      limitModeValue = limitMode.value;
+      try { selectedLimit(); }
+      catch (cause) { update(); setMessage(cause.message, "error"); limitInput.focus(); return; }
+      savePreferences();
+    });
+    limitInput.addEventListener("input", event => {
+      if (!event.isTrusted || busy() || preferencesBusy || isSingleBusy()) { update(); return; }
+      limitInputValue = limitInput.value;
+      update();
+      try { selectedLimit(); setMessage("The limit counts successful new saves in this run."); }
+      catch (cause) { setMessage(cause.message, "error"); }
+    });
+    limitInput.addEventListener("change", event => {
+      if (!event.isTrusted || busy() || preferencesBusy || isSingleBusy()) { update(); return; }
+      limitInputValue = limitInput.value;
+      try { selectedLimit(); }
+      catch (cause) { update(); setMessage(cause.message, "error"); return; }
+      savePreferences();
+    });
     primary.addEventListener("click", start);
     importButton.addEventListener("click", event => { if (event.isTrusted && !busy() && !isSingleBusy()) importFile.click(); });
     importFile.addEventListener("change", previewImport);
@@ -662,7 +789,7 @@
     pause.addEventListener("click", event => { if (event.isTrusted) controller?.pause(); });
     stop.addEventListener("click", event => { if (event.isTrusted) { if (releaseFailed) releaseJob(); else controller?.stop(); } });
     retry.addEventListener("click", async event => {
-      if (!event.isTrusted || starting || importing || importContext || clearingHistory || clearContext || retryRetired || releaseFailed || releasePending || !controller || !sameProfile()) return;
+      if (!event.isTrusted || starting || importing || importContext || clearingHistory || clearContext || retryRetired || releaseFailed || releasePending || !controller || !sameProfile() || limitReached()) return;
       starting = true;
       update();
       onBusyChange();
@@ -717,6 +844,10 @@
         modeValue = settings?.mode === "scan_all" ? "scan_all" : "batches";
         const value = Number(settings?.batchSize);
         batchValue = Number.isInteger(value) && value >= 1 && value <= 500 ? value : 35;
+        let maxNewVideos = null;
+        try { maxNewVideos = globalThis.ReelSaverDownloadLimits.normalize(settings?.maxNewVideos); } catch {}
+        limitModeValue = maxNewVideos == null ? "unlimited" : "custom";
+        limitInputValue = maxNewVideos == null ? "" : String(maxNewVideos);
       }
       settingsReady = true;
       update();
