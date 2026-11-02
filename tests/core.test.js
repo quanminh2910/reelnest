@@ -88,6 +88,19 @@ test("filenames stay inside a fixed download subfolder and retain the Reel ID", 
   assert.equal(buildFilename({ shortcode: "ABC" }), "Reel Saver/reel_ABC.mp4");
 });
 
+test("filenames preserve complete shortcode identities including boundary underscores", () => {
+  for (const shortcode of ["B_", "_B", "_B_", "_", "B__", "B-b_"]) {
+    assert.equal(buildFilename({ username: "co.author", shortcode }), `Reel Saver/co_author_${shortcode}.mp4`);
+  }
+  assert.notEqual(buildFilename({ shortcode: "B" }), buildFilename({ shortcode: "B_" }));
+});
+
+test("invalid shortcode filenames are rejected rather than transformed into another identity", () => {
+  for (const shortcode of [undefined, null, 123, "", " B", "B ", "../B", "B/C", "B\\C", "B?", "Ｂ", "B".repeat(29)]) {
+    assert.throws(() => buildFilename({ username: "creator", shortcode }), { code: "INVALID_REEL" });
+  }
+});
+
 test("only completed MP4 downloads produce a saved state", () => {
   assert.equal(summarizeDownload({ id: 1, state: "in_progress", mime: "video/mp4" }).state, "in_progress");
   assert.equal(summarizeDownload({ id: 1, state: "complete", mime: "video/mp4", exists: true }).state, "complete");

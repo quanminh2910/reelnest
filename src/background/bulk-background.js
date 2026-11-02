@@ -1,6 +1,7 @@
 import { profileSource } from "../instagram/profile-source.js";
 import { buildFilename, validateMedia, summarizeDownload, sanitizeFilenamePart, isInstagramMediaUrl } from "../shared/core.js";
 import "../shared/download-limits.js";
+import { getReceipt, verifyReceipt, recordReceipt, assertReceiptCapacity, isDownloadClaimedByOtherMedia, normalizeReport, previewReport } from "./browser-receipts.js";
 
 const limits = globalThis.ReelSaverDownloadLimits;
 
@@ -12,12 +13,14 @@ const operationKey = (jobId, id) => `${prefix(jobId)}operation:${id}`;
 const cancellationKey = (jobId, id, attemptId) => `${operationKey(jobId, id)}:${attemptId}`;
 const pending = new Map();
 const canceled = new Set();
+const canceledImports = new Set();
 const MAX_HISTORY_CANDIDATES = 200;
 let registration = Promise.resolve();
 let journal = Promise.resolve();
 const actions = new Set([
   "START", "PAGE", "RESOLVE", "DOWNLOAD", "STATUS", "CANCEL_ITEM", "ITEM_RESULT",
   "END", "REOPEN", "HEARTBEAT", "IDENTIFY", "SETTINGS_GET", "SETTINGS_SET", "CHECK_EXISTING",
+  "BROWSER_IMPORT_PREVIEW", "BROWSER_IMPORT_COMMIT", "BROWSER_IMPORT_CANCEL",
 ].map((action) => `REEL_SAVER_BULK_${action}`));
 
 export const isBulkMessage = (message) => actions.has(message?.type);
@@ -192,6 +195,24 @@ async function writeOperation(ctx, jobId, mediaId, attemptId, patch, outcome) {
 
 async function recordBrowser(ctx, jobId, mediaId, attemptId, download, patch = {}) {
   const outcome = download?.state === "complete" ? "saved" : download?.state === "interrupted" ? "released" : "unknown";
+  if (outcome === "saved") {
+    const job = await currentJob(ctx, jobId, { inactive: true, profile: false });
+    const item = await get(memberKey(jobId, mediaId));
+    // Chrome has already returned this ID. Keep that acceptance proof in the
+    // session journal before a durable-receipt write can fail; filename/time
+    // reconciliation could otherwise confuse a rapid deliberate older copy.
+    await writeOperation(ctx, jobId, mediaId, attemptId, { ...patch, attemptId, state: "in_progress", downloadId: download.id,
+      ...(download.filename ? { filename: download.filename } : {}) }, "unknown");
+    const raw = await rawOwnDownload(download.id);
+    if (!item || !raw) throw problem("CACHE_RECEIPT_UNCONFIRMED", "The saved video's Chrome record could not be confirmed. Retry its status before downloading again.", "history");
+    // Persist identity before releasing the allowance. A lost storage write or
+    // worker response replays this same Chrome download rather than saving again.
+    await recordReceipt(job.profile.id, item, raw, { check: async () => {
+      await currentJob(ctx, jobId, { inactive: true, profile: false });
+      const operation = await get(operationKey(jobId, mediaId));
+      if (!operation || operation.attemptId !== attemptId) throw problem("STALE_OPERATION", "This receipt belongs to an older download attempt.");
+    } });
+  }
   return writeOperation(ctx, jobId, mediaId, attemptId, { ...patch,
     state: outcome === "saved" ? "saved" : outcome === "released" ? "failed" : "in_progress",
     ...(Number.isInteger(download?.id) ? { downloadId: download.id } : {}),
@@ -211,13 +232,14 @@ async function tabAtProfile(tabId, username) {
   return tab;
 }
 
-async function currentJob(ctx, jobId, { inactive = false, profile = true } = {}) {
+async function currentJob(ctx, jobId, { inactive = false, profile = true, importing = false } = {}) {
   const job = await get(ACTIVE);
   if (!job || job.jobId !== jobId || job.tabId !== ctx.tabId ||
       (ctx.documentId && job.documentId && ctx.documentId !== job.documentId)) {
     throw problem("STALE_JOB", "This batch belongs to a different tab or an older page. Start a new batch here.");
   }
   if (!inactive && !job.active) throw problem("STALE_JOB", "This batch has ended. Start a new batch or retry its failed items.");
+  if (job.kind === "browser_import" && !importing) throw problem("JOB_BUSY", "Finish or cancel the browser history import before downloading.");
   if (profile) await tabAtProfile(ctx.tabId, job.profile.username);
   return job;
 }
@@ -282,7 +304,7 @@ async function restoreTab(job) {
   }
 }
 
-async function start(ctx, message) {
+async function start(ctx, message, kind) {
   return locked(async () => {
     const selected = options(message.options);
     const old = await get(ACTIVE);
@@ -310,6 +332,7 @@ async function start(ctx, message) {
       profile, options: selected, active: true, state: "running", cursor: null,
       exhausted: false, visited: [], createdAt: Date.now(), updatedAt: Date.now(),
       committedNewSaves: 0, reservationMediaId: null,
+      ...(kind ? { kind } : {}),
       ...(typeof tab.autoDiscardable === "boolean" ? { previousAutoDiscardable: tab.autoDiscardable } : {}),
     };
     // Discard prevention is best effort. The queue still handles document loss.
@@ -365,8 +388,7 @@ async function page(ctx, message) {
 }
 
 async function getOwnDownload(id) {
-  if (!Number.isInteger(id)) return null;
-  const item = (await chrome.downloads.search({ id })).find((entry) => entry.byExtensionId === chrome.runtime.id && entry.id === id);
+  const item = await rawOwnDownload(id);
   if (!item) return null;
   return { ...summarizeDownload(item), ...(item.error ? { errorCode: item.error } : {}),
     ...(Number.isFinite(item.bytesReceived) && item.bytesReceived >= 0 ? { bytesReceived: item.bytesReceived } : {}),
@@ -374,10 +396,18 @@ async function getOwnDownload(id) {
     ...(Number.isFinite(item.fileSize) && item.fileSize >= 0 ? { bytesWritten: item.fileSize } : {}) };
 }
 
+async function rawOwnDownload(id) {
+  if (!Number.isInteger(id) || id < 0) return null;
+  return (await chrome.downloads.search({ id })).find((entry) => entry.byExtensionId === chrome.runtime.id && entry.id === id) || null;
+}
+
 const escapePattern = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 async function existingBrowserDownload(ctx, job, item) {
   if (job.options.skipExisting === false) return null;
+  const recorded = await verifyReceipt(job.profile.id, item);
+  await currentJob(ctx, job.jobId);
+  if (recorded) return recorded;
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   const numericId = [...item.shortcode].reduce((value, character) => value * 64n + BigInt(alphabet.indexOf(character)), 0n).toString();
   if (numericId !== item.mediaId || item.shortcode.length > 1 && item.shortcode.startsWith("A")) {
@@ -412,6 +442,17 @@ async function existingBrowserDownload(ctx, job, item) {
         !isInstagramMediaUrl(download.url, { video: true }) ||
         download.finalUrl && !isInstagramMediaUrl(download.finalUrl, { video: true }) ||
         !name || name[1].toLowerCase() !== author.toLowerCase()) continue;
+    if (await isDownloadClaimedByOtherMedia(download.id, item.mediaId)) continue;
+    try {
+      await recordReceipt(job.profile.id, item, download, { check: async () => {
+        await currentJob(ctx, job.jobId);
+        if (await get(operationKey(job.jobId, item.mediaId))) throw problem("STALE_OPERATION", "This Reel already has an active save in the current run.");
+      } });
+    } catch (error) {
+      if (error?.code === "CACHE_RECEIPT_IDENTITY_CONFLICT") continue;
+      throw error;
+    }
+    await currentJob(ctx, job.jobId);
     return { cacheHit: true, filename, bytesWritten: download.fileSize, downloadId: download.id, verification: "browser_history" };
   }
   return null;
@@ -468,12 +509,16 @@ async function resolve(ctx, message, browser = false) {
     }
     if (previous?.state === "saved" && !browser) return { ok: true, alreadySaved: true,
       filename: previous.filename, result: { filename: previous.filename, ...(previous.bytesWritten != null ? { bytesWritten: previous.bytesWritten } : {}) } };
-    if (browser) {
+    // A resumed own-run attempt must settle as a new save in this run, even
+    // if another matching historical download appears while it is suspended.
+    // Returning a history hit here would strand its existing allowance slot.
+    if (browser && !previous) {
       const existing = await existingBrowserDownload(ctx, job, item);
       if (existing) return { ok: true, alreadySaved: true, result: existing };
     }
     const cancelKey = cancellationKey(job.jobId, item.mediaId, attemptId);
     if (canceled.has(cancelKey)) throw problem("SAVE_CANCELLED", "The download was canceled.");
+    if (browser) await assertReceiptCapacity(job.profile.id, item);
     await reserveOperation(ctx, job.jobId, item, attemptId);
     const response = await source(ctx, { action: "resolve", profile: job.profile, item });
     await currentJob(ctx, job.jobId);
@@ -500,7 +545,10 @@ async function resolve(ctx, message, browser = false) {
     }
     const download = await getOwnDownload(id) || { id, state: "in_progress" };
     try { await recordBrowser(ctx, job.jobId, item.mediaId, attemptId, download, { filename, downloadId: id }); }
-    catch { throw problem("RECONCILE_REQUIRED", "Chrome started the video but its status could not be recorded. Check Chrome Downloads before retrying."); }
+    catch (error) {
+      if (/^CACHE_RECEIPT_/.test(error?.code || "")) throw error;
+      throw problem("RECONCILE_REQUIRED", "Chrome started the video but its status could not be recorded. Check Chrome Downloads before retrying.");
+    }
     return { ok: true, download, filename };
   })();
   pending.set(key, run);
@@ -638,6 +686,100 @@ async function end(ctx, message) {
   });
 }
 
+async function browserImportPreview(ctx, message) {
+  // Validate the selected report before acquiring the shared job owner. The
+  // profile's numeric identity is rechecked after the page identifies itself.
+  if (!message.report || message.report.version !== 1 || !Array.isArray(message.report.items) ||
+      message.report.items.length > 50000 || JSON.stringify(message.report).length > 16 * 1024 * 1024) {
+    throw problem("CACHE_RECEIPT_INVALID_REPORT", "Choose a supported ReelNest download report of at most 16 MiB and 50,000 entries.", "import");
+  }
+  const registered = await start(ctx, { options: { mode: "batches", batchSize: 35, destination: "downloads", skipExisting: true } }, "browser_import");
+  const jobId = registered.job.jobId;
+  try {
+    const normalized = normalizeReport(registered.job.profile.id, message.report);
+    const verified = await previewReport(registered.job.profile.id, message.report, { check: () => browserImportCurrent(ctx, jobId) });
+    const summary = { saved: normalized.items.length, ready: 0, alreadyRecorded: 0, missing: verified.counts.missing, conflicts: 0, ignored: normalized.ignored || 0 };
+    const candidates = [];
+    for (const entry of verified.items) {
+      if (canceledImports.has(jobId)) throw problem("SAVE_CANCELLED", "The history import was canceled.", "import");
+      await currentJob(ctx, jobId, { importing: true });
+      const recorded = await getReceipt(registered.job.profile.id, entry);
+      candidates.push(entry);
+      if (recorded?.downloadId === entry.downloadId && recorded.filename === entry.filename && recorded.bytesWritten === entry.bytesWritten) {
+        summary.alreadyRecorded++;
+        continue;
+      }
+      summary.ready++;
+    }
+    await mutate(async () => {
+      const job = await currentJob(ctx, jobId, { importing: true });
+      if (canceledImports.has(jobId)) throw problem("SAVE_CANCELLED", "The history import was canceled.", "import");
+      await put({ [ACTIVE]: { ...job, browserImport: { items: candidates, summary }, updatedAt: Date.now() } });
+    });
+    return { ok: true, previewId: jobId, profile: registered.job.profile, summary };
+  } catch (error) {
+    await releaseBrowserImport(ctx, jobId).catch(() => {});
+    throw error;
+  }
+}
+
+async function browserImportCommit(ctx, message) {
+  return locked(async () => {
+    const job = await browserImportCurrent(ctx, message.previewId);
+    if (job.kind !== "browser_import" || !job.browserImport) throw problem("CACHE_RECEIPT_INVALID_PREVIEW", "Open a report preview before importing browser history.", "import");
+    const identified = checkProfile((await source(ctx, { action: "identify" })).profile);
+    await browserImportCurrent(ctx, job.jobId);
+    if (identified.id !== job.profile.id || identified.username.toLowerCase() !== job.profile.username.toLowerCase()) {
+      throw problem("CACHE_RECEIPT_PROFILE_CHANGED", "The profile identity changed. Cancel this preview and open the report again.", "import");
+    }
+    const result = { imported: 0, alreadyRecorded: 0,
+      missing: job.browserImport.summary.missing, conflicts: job.browserImport.summary.conflicts };
+    for (const entry of job.browserImport.items) {
+      if (canceledImports.has(job.jobId)) break;
+      await browserImportCurrent(ctx, job.jobId);
+      if (await verifyReceipt(job.profile.id, entry)) { result.alreadyRecorded++; continue; }
+      const raw = await rawOwnDownload(entry.downloadId);
+      if (canceledImports.has(job.jobId)) break;
+      await browserImportCurrent(ctx, job.jobId);
+      const filename = typeof raw?.filename === "string" ? raw.filename.replaceAll("\\", "/").split("/").pop() : "";
+      if (!raw || filename !== entry.filename || raw.fileSize !== entry.bytesWritten) { result.missing++; continue; }
+      // The selected report binds this exact filename/size to the Reel ID;
+      // recordReceipt revalidates the Chrome provenance and completed output.
+      try { await recordReceipt(job.profile.id, entry, raw, { check: () => browserImportCurrent(ctx, job.jobId) }); result.imported++; }
+      catch (error) {
+        if (error?.code === "SAVE_CANCELLED") break;
+        if (error?.code === "CACHE_RECEIPT_UNVERIFIED") { result.missing++; continue; }
+        throw error;
+      }
+    }
+    return { ok: true, ...result, canceled: canceledImports.has(job.jobId) };
+  });
+}
+
+async function browserImportCurrent(ctx, jobId) {
+  if (canceledImports.has(jobId)) throw problem("SAVE_CANCELLED", "The browser history import was canceled.", "import");
+  return currentJob(ctx, jobId, { importing: true });
+}
+
+async function releaseBrowserImport(ctx, previewId) {
+  return locked(() => mutate(async () => {
+    const observed = await get(ACTIVE);
+    if (!observed || observed.kind !== "browser_import" || (previewId && observed.jobId !== previewId)) return { ok: true };
+    const job = await currentJob(ctx, observed.jobId, { inactive: true, profile: false, importing: true });
+    await put({ [ACTIVE]: { ...job, active: false, state: "stopped", updatedAt: Date.now() } });
+    await restoreTab(job);
+    return { ok: true };
+  }));
+}
+
+async function browserImportCancel(ctx, message) {
+  const observed = await get(ACTIVE);
+  if (!observed || observed.kind !== "browser_import" || message.previewId && message.previewId !== observed.jobId) return { ok: true };
+  await currentJob(ctx, observed.jobId, { inactive: true, profile: false, importing: true });
+  canceledImports.add(observed.jobId);
+  return releaseBrowserImport(ctx, observed.jobId);
+}
+
 export async function handleBulkMessage(message, sender) {
   if (!isBulkMessage(message)) return undefined;
   try {
@@ -664,6 +806,9 @@ export async function handleBulkMessage(message, sender) {
       await tabAtProfile(ctx.tabId, profile.username);
       return { ok: true, profile };
     }
+    if (action === "BROWSER_IMPORT_PREVIEW") return await browserImportPreview(ctx, message);
+    if (action === "BROWSER_IMPORT_COMMIT") return await browserImportCommit(ctx, message);
+    if (action === "BROWSER_IMPORT_CANCEL") return await browserImportCancel(ctx, message);
     if (action === "START") return await start(ctx, message);
     if (action === "PAGE") return await page(ctx, message);
     if (action === "CHECK_EXISTING") return await checkExisting(ctx, message);

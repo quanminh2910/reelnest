@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ReelNest",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Save Instagram Reels to profile libraries with download limits, history, duplicate skipping, and pause/resume.",
   "minimum_chrome_version": "111",
   "permissions": ["activeTab", "scripting", "downloads", "storage"],

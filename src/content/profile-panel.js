@@ -227,7 +227,7 @@
       destinationHint.textContent = "Chrome will open its Save As dialog when you download.";
     } else {
       folderName.textContent = "Downloads / Reel Saver";
-      destinationHint.textContent = "Profile downloads can skip completed ReelNest downloads in Chrome history. Files outside that history are not checked; additional copies get unique names.";
+      destinationHint.textContent = "Profile downloads remember saved Reels and check their files through Chrome history. Import an older report to recognize earlier downloads; additional copies get unique names.";
     }
     if (!globalThis.ReelSaverFolderWriter?.isSupported()) {
       chooseFolder.title = "This browser does not support choosing a folder here. Use Ask where to save instead.";

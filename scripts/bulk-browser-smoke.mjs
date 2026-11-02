@@ -31,7 +31,9 @@ const fixture = `(() => {
     jobNumber: 0, nextId: 0, browserState: 'complete',
     failItem: null, failCount: 0, holdPage: false, heldPages: [], holdResolve: false, heldResolves: [],
     failRelease: false, releaseCalls: 0, failAck: 0, failNegativeAck: 0, failTransfers: 0,
-    report: null, mp4Playable: false, completeOnCancel: false, browserHistory: [], failHistory: false };
+    report: null, mp4Playable: false, completeOnCancel: false, browserHistory: [], failHistory: false,
+    browserImport: null, browserReceiptKeys: new Set(), receiptImports: 0, importNumber: 0,
+    failBrowserCommitAck: 0, failBrowserPreviewAck: 0, failBrowserImportCancel: 0, holdBrowserCommit: false, heldBrowserCommits: [] };
   const pageStyles = new CSSStyleSheet();
   pageStyles.replaceSync('body{font:16px system-ui;background:#fafafa;color:#222;margin:0}main{max-width:920px;margin:40px auto}header{padding:20px;border-bottom:1px solid #ddd}h1{font-size:24px}');
   document.adoptedStyleSheets=[pageStyles];
@@ -67,7 +69,8 @@ const fixture = `(() => {
   const success = result=>({ok:true,...result});
   const browserCache = item=>{
     if(state.job?.options.skipExisting===false)return null;
-    const record=state.browserHistory.find(record=>record.mediaId===item.mediaId&&record.profileId===profile.id&&record.download.state==='complete'&&record.download.exists&&record.download.fileSize>0);
+    const record=state.browserHistory.find(record=>record.mediaId===item.mediaId&&record.profileId===profile.id&&
+      (!record.receiptOnly||state.browserReceiptKeys.has(profile.id+':'+item.mediaId))&&record.download.state==='complete'&&record.download.exists&&record.download.fileSize>0);
     return record?{cacheHit:true,filename:record.download.filename,bytesWritten:record.download.fileSize,downloadId:record.download.id,verification:'browser_history'}:null;
   };
   const mediaFor=item=>({mediaId:item.mediaId,shortcode:item.shortcode,pageUrl:'https://www.instagram.com/reel/'+item.shortcode+'/',username:profile.username,width:32,height:32,url:'https://scontent.cdninstagram.com/'+item.shortcode+'.mp4?secret=never_export'});
@@ -79,6 +82,38 @@ const fixture = `(() => {
       if(type==='REEL_SAVER_BULK_SETTINGS_GET')return success({settings:{mode:state.mode,batchSize:state.batchSize,maxNewVideos:state.maxNewVideos??null}});
       if(type==='REEL_SAVER_BULK_SETTINGS_SET'){Object.assign(state,request.settings);return success({settings:request.settings});}
       if(type==='REEL_SAVER_BULK_IDENTIFY')return success({profile:state.identifyProfile||profile});
+      if(type==='REEL_SAVER_BULK_BROWSER_IMPORT_PREVIEW'){
+        if(request.report?.version!==1||request.report.profile?.id!==profile.id||!Array.isArray(request.report.items))return {ok:false,error:{code:'CACHE_INVALID_REPORT',message:'Choose a report for this Instagram profile.'}};
+        const entries=request.report.items.filter(item=>item.state==='saved');
+        const summary={saved:entries.length,ready:0,alreadyRecorded:0,missing:0,conflicts:0};
+        for(const item of entries){
+          const match=state.browserHistory.find(record=>record.download.filename===item.filename&&record.download.fileSize===item.bytesWritten&&record.download.state==='complete'&&record.download.exists);
+          if(!match)summary.missing++;else if(state.browserReceiptKeys.has(profile.id+':'+item.mediaId))summary.alreadyRecorded++;else summary.ready++;
+        }
+        state.browserImport={previewId:'browser_import_'+(++state.importNumber),profile,entries};
+        if(state.failBrowserPreviewAck>0){state.failBrowserPreviewAck--;return {ok:false,error:{code:'NETWORK_FAILED',message:'Fixture preview response lost'}};}
+        return success({previewId:state.browserImport.previewId,profile,summary});
+      }
+      if(type==='REEL_SAVER_BULK_BROWSER_IMPORT_COMMIT'){
+        const context=state.browserImport;
+        if(!context||context.previewId!==request.previewId)return {ok:false,error:{code:'STALE_JOB',message:'The import preview expired.'}};
+        if(state.holdBrowserCommit)await new Promise(resolve=>state.heldBrowserCommits.push(resolve));
+        if(context.canceled)return {ok:false,error:{code:'CACHE_IMPORT_CANCELLED',message:'The import was canceled.'}};
+        if(!location.pathname.toLowerCase().startsWith('/'+context.profile.username.toLowerCase()+'/'))return {ok:false,error:{code:'PROFILE_CHANGED',message:'The profile changed.'}};
+        const result={imported:0,alreadyRecorded:0,missing:0,conflicts:0};
+        for(const item of context.entries){
+          const key=profile.id+':'+item.mediaId;
+          const match=state.browserHistory.find(record=>record.download.filename===item.filename&&record.download.fileSize===item.bytesWritten&&record.download.state==='complete'&&record.download.exists);
+          if(!match)result.missing++;else if(state.browserReceiptKeys.has(key))result.alreadyRecorded++;else {state.browserReceiptKeys.add(key);state.receiptImports++;result.imported++;}
+        }
+        if(state.failBrowserCommitAck>0){state.failBrowserCommitAck--;return {ok:false,error:{code:'NETWORK_FAILED',message:'Fixture committed response lost'}};}
+        return success(result);
+      }
+      if(type==='REEL_SAVER_BULK_BROWSER_IMPORT_CANCEL'){
+        if(state.failBrowserImportCancel>0){state.failBrowserImportCancel--;return {ok:false,error:{code:'NETWORK_FAILED',message:'Fixture import release failed'}};}
+        if(state.browserImport)state.browserImport.canceled=true;
+        state.heldBrowserCommits.splice(0).forEach(resolve=>resolve());state.browserImport=null;return success({});
+      }
       if(type==='REEL_SAVER_BULK_START'){state.jobNumber++;state.job={jobId:'fixture_job_'+state.jobNumber,profile,options:request.options};return success({job:state.job});}
       if(type==='REEL_SAVER_BULK_PAGE'){
         if(state.holdPage)await new Promise(resolve=>state.heldPages.push(resolve));
@@ -298,10 +333,10 @@ try {
   const importPath=path.join(profile,'legacy-report.json');
   await writeFile(importPath,JSON.stringify(importedReport));
   await page('DOM.enable');
-  async function chooseReport(){
+  async function chooseReport(reportPath=importPath){
     const input=await page('Runtime.evaluate',{expression:query('[data-role=cache-import-file]'),returnByValue:false});
     assert.ok(input.result.objectId,'actual import input exists');
-    await page('DOM.setFileInputFiles',{objectId:input.result.objectId,files:[importPath]});
+    await page('DOM.setFileInputFiles',{objectId:input.result.objectId,files:[reportPath]});
   }
   const beforeImport=(await mp4Files()).length;
   await chooseReport();
@@ -773,6 +808,95 @@ try {
   assert.deepEqual(await evaluate("window.__fixture.events.filter(event=>event.type==='REEL_SAVER_BULK_DOWNLOAD').map(event=>event.mediaId)"),['900001']);
   assert.equal(await evaluate(`${query('[data-count=alreadyDownloaded]')}.textContent`),'0');
   console.log('PASS history failures pause safely and an explicit skip-off run can save another copy');
+
+  await click(query('[data-role=skip-existing]'));
+  assert.equal(await evaluate(`${query('[data-role=bulk-history]')}.hidden`),false,'browser history exposes report migration');
+  assert.equal(await evaluate(`${query('[data-role=cache-clear]')}.hidden`),true,'native library clearing is hidden in Browser Downloads');
+  await evaluate(`window.__fixture.baseId=127;window.__fixture.total=1;window.__fixture.events=[];
+    window.__fixture.browserHistory.push({profileId:'12345',mediaId:'127',receiptOnly:true,download:{id:9000,state:'complete',exists:true,fileSize:2048,totalBytes:2048,filename:'coauthor_B.mp4'}})`);
+  const browserImportReport={version:1,profile:{id:'12345',username:'example_creator'},items:[{mediaId:'127',shortcode:'B_',state:'saved',filename:'coauthor_B.mp4',bytesWritten:2048}]};
+  const browserImportPath=path.join(profile,'browser-import-report.json');
+  const wrongBrowserImportPath=path.join(profile,'browser-import-wrong-profile.json');
+  await writeFile(browserImportPath,JSON.stringify(browserImportReport));
+  await writeFile(wrongBrowserImportPath,JSON.stringify({...browserImportReport,profile:{id:'999',username:'other_creator'}}));
+  const beforeBrowserImport={files:(await mp4Files()).length,downloads:await evaluate('window.__fixture.downloads'),transfers:await evaluate('window.__fixture.mediaTransfers'),receipts:await evaluate('window.__fixture.receiptImports')};
+  await chooseReport(browserImportPath);
+  await waitFor(`!${query('[data-role=cache-import-summary]')}.hidden && !${query('[data-role=cache-import-commit]')}.disabled`,'browser report preview');
+  assert.match(await evaluate(`${query('[data-role=cache-import-summary]')}.textContent`),/1 verified and ready to record/);
+  assert.equal(await evaluate('window.__fixture.receiptImports'),beforeBrowserImport.receipts,'preview does not create a receipt');
+  assert.equal(await evaluate(`${query('[data-role=bulk-start]')}.disabled`),true,'preview owns the UI until confirm/cancel');
+  await evaluate(`${query('[data-role=cache-import-commit]')}.click()`);
+  assert.equal(await evaluate('window.__fixture.receiptImports'),beforeBrowserImport.receipts,'synthetic confirmation is ignored');
+  await click(query('[data-role=cache-import-cancel]'));
+  await waitFor(`!window.__fixture.browserImport && ${query('[data-role=cache-import-summary]')}.hidden`,'browser import Cancel releases preview');
+  await chooseReport(browserImportPath);
+  await waitFor(`!${query('[data-role=cache-import-commit]')}.disabled`,'browser import preview reopened');
+  await evaluate("history.pushState({},'', '/other_creator/reels/');window.dispatchEvent(new PopStateEvent('popstate'))");
+  await waitFor('window.__fixture.browserImport===null','navigation cancels an unconfirmed browser import');
+  assert.equal(await evaluate('window.__fixture.receiptImports'),beforeBrowserImport.receipts);
+  await evaluate("history.pushState({},'', '/example_creator/reels/');window.dispatchEvent(new PopStateEvent('popstate'))");
+  await waitFor(`!${query('[data-role=cache-import]')}.disabled`,'return to original profile');
+  await chooseReport(wrongBrowserImportPath);
+  await waitFor(`/report for this Instagram profile/.test(${query('[data-role=bulk-status]')}.textContent)`,'wrong profile report rejected');
+  assert.equal(await evaluate('window.__fixture.browserImport'),null);
+  await chooseReport(browserImportPath);
+  await waitFor(`!${query('[data-role=cache-import-commit]')}.disabled`,'verified legacy browser report ready');
+  await click(query('[data-role=cache-import-commit]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('History recorded: 1 imported') && !window.__fixture.browserImport`,'explicit confirmation records browser receipt and releases');
+  assert.equal(await evaluate('window.__fixture.receiptImports'),beforeBrowserImport.receipts+1);
+  assert.equal(await evaluate('window.__fixture.downloads'),beforeBrowserImport.downloads,'receipt import does not start Chrome Downloads');
+  assert.equal(await evaluate('window.__fixture.mediaTransfers'),beforeBrowserImport.transfers,'receipt import does not fetch video bytes');
+  assert.equal((await mp4Files()).length,beforeBrowserImport.files,'receipt import does not copy or modify library videos');
+  await click(query('[data-role=bulk-start]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('Completed.') && Number(${query('[data-count=alreadyDownloaded]')}.textContent)===1`,'imported coauthor/underscore receipt skips next run');
+  assert.equal(await evaluate('window.__fixture.downloads'),beforeBrowserImport.downloads);
+  console.log('PASS browser report migration: read-only preview, explicit trusted confirmation, Cancel/navigation/profile fences, metadata-only import, later coauthor/underscore skip');
+
+  const receiptReport=(mediaId,shortcode,filename)=>({version:1,profile:{id:'12345',username:'example_creator'},items:[{mediaId,shortcode,state:'saved',filename,bytesWritten:2048}]});
+  const lostCommitReportPath=path.join(profile,'browser-import-lost-commit.json');
+  await writeFile(lostCommitReportPath,JSON.stringify(receiptReport('191','C_','coauthor_C.mp4')));
+  await evaluate("window.__fixture.browserHistory.push({profileId:'12345',mediaId:'191',receiptOnly:true,download:{id:9001,state:'complete',exists:true,fileSize:2048,filename:'coauthor_C.mp4'}});window.__fixture.failBrowserCommitAck=1");
+  await chooseReport(lostCommitReportPath);
+  await waitFor(`!${query('[data-role=cache-import-commit]')}.disabled`,'browser import with lost commit acknowledgement');
+  const receiptsBeforeRetry=await evaluate('window.__fixture.receiptImports');
+  await click(query('[data-role=cache-import-commit]'));
+  await waitFor(`${query('[data-role=cache-import-commit]')}.textContent==='Retry import' && !${query('[data-role=cache-import-commit]')}.disabled`,'lost acknowledgement keeps a retryable import');
+  assert.equal(await evaluate('window.__fixture.receiptImports'),receiptsBeforeRetry+1);
+  await click(query('[data-role=cache-import-commit]'));
+  await waitFor(`${query('[data-role=bulk-status]')}.textContent.startsWith('History recorded: 0 imported, 1 already recorded') && !window.__fixture.browserImport`,'retry confirms the same receipt without a duplicate write');
+  assert.equal(await evaluate('window.__fixture.receiptImports'),receiptsBeforeRetry+1);
+
+  const heldCommitReportPath=path.join(profile,'browser-import-held-commit.json');
+  await writeFile(heldCommitReportPath,JSON.stringify(receiptReport('255','D_','coauthor_D.mp4')));
+  await evaluate("window.__fixture.browserHistory.push({profileId:'12345',mediaId:'255',receiptOnly:true,download:{id:9002,state:'complete',exists:true,fileSize:2048,filename:'coauthor_D.mp4'}});window.__fixture.holdBrowserCommit=true");
+  await chooseReport(heldCommitReportPath);
+  await waitFor(`!${query('[data-role=cache-import-commit]')}.disabled`,'held browser commit preview');
+  await click(query('[data-role=cache-import-commit]'));
+  await waitFor('window.__fixture.heldBrowserCommits.length===1','held receipt commit');
+  assert.equal(await evaluate(`${query('[data-role=cache-import-cancel]')}.disabled`),false,'Cancel remains available during browser commit');
+  await click(query('[data-role=cache-import-cancel]'));
+  await waitFor(`!window.__fixture.browserImport && !${query('[data-role=bulk-start]')}.disabled`,'Cancel stops an in-flight browser import and releases ownership');
+  assert.equal(await evaluate("window.__fixture.browserReceiptKeys.has('12345:255')"),false);
+
+  const navigatedCommitReportPath=path.join(profile,'browser-import-navigated-commit.json');
+  await writeFile(navigatedCommitReportPath,JSON.stringify(receiptReport('319','E_','coauthor_E.mp4')));
+  await evaluate("window.__fixture.browserHistory.push({profileId:'12345',mediaId:'319',receiptOnly:true,download:{id:9003,state:'complete',exists:true,fileSize:2048,filename:'coauthor_E.mp4'}})");
+  await chooseReport(navigatedCommitReportPath);
+  await waitFor(`!${query('[data-role=cache-import-commit]')}.disabled`,'navigation-during-commit preview');
+  await click(query('[data-role=cache-import-commit]'));
+  await waitFor('window.__fixture.heldBrowserCommits.length===1','second held receipt commit');
+  await evaluate("history.pushState({},'', '/other_creator/reels/');window.dispatchEvent(new PopStateEvent('popstate'))");
+  await waitFor('window.__fixture.browserImport===null','navigation cancels a running browser import');
+  assert.equal(await evaluate("window.__fixture.browserReceiptKeys.has('12345:319')"),false);
+  await evaluate("history.pushState({},'', '/example_creator/reels/');window.dispatchEvent(new PopStateEvent('popstate'));window.__fixture.holdBrowserCommit=false;window.__fixture.failBrowserPreviewAck=1;window.__fixture.failBrowserImportCancel=1");
+  await waitFor(`!${query('[data-role=cache-import]')}.disabled`,'return for lost-preview cleanup');
+  await chooseReport(browserImportPath);
+  await waitFor(`!${query('[data-role=cache-import-summary]')}.hidden && !${query('[data-role=cache-import-cancel]')}.disabled`,'lost preview and failed release retain Cancel');
+  assert.equal(await evaluate(`${query('[data-role=bulk-start]')}.disabled`),true);
+  await click(query('[data-role=cache-import-cancel]'));
+  await waitFor(`!window.__fixture.browserImport && !${query('[data-role=bulk-start]')}.disabled`,'Cancel retries unknown-preview release without recording files');
+  assert.equal(await evaluate('window.__fixture.downloads'),beforeBrowserImport.downloads);
+  console.log('PASS browser receipt import retries a lost acknowledgement idempotently and supports Cancel/navigation during commit plus lost-preview release recovery');
 
   assert.deepEqual(exceptions,[],'no uncaught browser exceptions');
   console.log('Screenshot: artifacts/bulk-panel-preview.png');

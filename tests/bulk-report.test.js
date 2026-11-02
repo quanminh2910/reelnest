@@ -42,6 +42,23 @@ test("legacy snapshots export unlimited reports without inventing a completion r
   assert.equal(Object.hasOwn(report, "completionReason"), false);
 });
 
+test("browser reports preserve profile identity, full underscore shortcode, and coauthor filename for receipt migration", () => {
+  const report = plain(context.ReelSaverBulkPanel.buildReport({
+    jobId: "browser-receipt", profile: { id: "123", username: "viewed_profile" }, mode: "batches", batchSize: 35,
+    destination: "downloads", skipExisting: true, maxNewVideos: 1, committedNewSaves: 1,
+    completionReason: "profile_limit_reached", state: "completed", phase: "downloading", sourceExhausted: false,
+    counts: { discovered: 1, saved: 1 }, items: [{ mediaId: "127", shortcode: "B_", state: "saved", attempts: 1,
+      filename: "coauthor_B_.mp4", bytesWritten: 2048, downloadId: 7 }],
+  }));
+  assert.deepEqual(report.profile, { id: "123", username: "viewed_profile" });
+  assert.equal(report.destination, "downloads");
+  assert.equal(report.skipExisting, true);
+  assert.equal(report.items[0].mediaId, "127");
+  assert.equal(report.items[0].shortcode, "B_");
+  assert.equal(report.items[0].filename, "coauthor_B_.mp4");
+  assert.equal(report.items[0].bytesWritten, 2048);
+});
+
 test("reports preserve top-level and per-item diagnostics while omitting credentials and full paths", () => {
   const diagnostic = {
     queryName: "PolarisProfileReelsTabContentQuery_connection", adapterVersion: "profile-relay-v2",
