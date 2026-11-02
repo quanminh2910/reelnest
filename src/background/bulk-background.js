@@ -935,7 +935,14 @@ export async function cleanupBulkTab(tabId) {
   await locked(() => mutate(async () => {
     const current = await get(ACTIVE);
     if (current?.jobId !== observed.jobId || current.documentId !== observed.documentId) return;
-    await put({ [ACTIVE]: { ...current, active: !!allowance(current).reserved, state: "interrupted", updatedAt: Date.now() } });
+    await put({ [ACTIVE]: { ...current, active: current.queue ? false : !!allowance(current).reserved, state: "interrupted", updatedAt: Date.now() } });
     await restoreTab(current);
   }));
+}
+
+export async function interruptQueueChild(jobId) {
+  return mutate(async () => {
+    const current = await get(ACTIVE);
+    if (current?.jobId === jobId && current.queue) await put({ [ACTIVE]: { ...current, active: false, state: "interrupted", updatedAt: Date.now() } });
+  });
 }

@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { handleProfileQueueMessage, cleanupProfileQueueTab } from '../src/background/profile-queue-background.js';
 import { handleBulkMessage } from '../src/background/bulk-background.js';
 import { createMemoryQueueBackend, setQueueStoreBackendForTests } from '../src/background/profile-queue-store.js';
-import { QUEUE_OWNER, BULK_ACTIVE } from '../src/background/profile-queue-owner.js';
+import { QUEUE_OWNER, MUTATION_OWNER, BULK_ACTIVE } from '../src/background/profile-queue-owner.js';
 
 const extensionId = 'profile-queue-integration';
 const hostId = 7;
@@ -37,6 +37,10 @@ function fixture(options = {}) {
       return { [key]: plain(state[name][key]) };
     },
     async set(values) {
+      if (name === 'session' && values[QUEUE_OWNER]) {
+        state.ownerWrites = (state.ownerWrites || 0) + 1;
+        if (state.failOwnerWriteNumber === state.ownerWrites) throw new Error('Owner storage unavailable');
+      }
       if (name === 'session' && state.ownerWriteGate && values[QUEUE_OWNER]?.navigating === true && !state.ownerWriteGated) {
         state.ownerWriteGated = true; state.ownerWriting.resolve(); await state.ownerWriteGate.promise;
       }
@@ -46,8 +50,10 @@ function fixture(options = {}) {
     async remove(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) delete state[name][key]; },
   });
   const chrome = {
-    runtime: { id: extensionId }, storage: { local: storage('local'), session: storage('session') },
+    runtime: { id: extensionId, getURL: path => `chrome-extension://${extensionId}/${path}`, onMessage: { addListener() {} } },
+    storage: { local: storage('local'), session: storage('session') },
     tabs: {
+      onRemoved: { addListener() {} }, onUpdated: { addListener() {} },
       async get(tabId) { const tab = state.tabs.get(tabId); if (!tab) throw new Error('Tab closed'); return plain(tab); },
       async create(value) {
         const id = ++state.nextTab;
@@ -68,14 +74,17 @@ function fixture(options = {}) {
       if (value.target.documentIds && !value.target.documentIds.includes(tab.documentId)) throw new Error('Document replaced');
       const username = new URL(tab.url).pathname.split('/')[1];
       const fixtureProfile = state.profiles.get(username);
-      const action = value.args?.[0]?.action || 'probe';
+      const action = value.func.name === 'extractReel' ? 'extract' : value.args?.[0]?.action || 'probe';
       state.sourceCalls.push({ action, tabId: tab.id, documentId: tab.documentId, target: plain(value.target), username });
       if (action === 'probe' && state.probeGate) { state.probing.resolve(); await state.probeGate.promise; }
       if (action === 'identify' && state.identifyGate) { state.identifying.resolve(); await state.identifyGate.promise; }
       if (action === 'page' && state.pageGate) { state.paging.resolve(); await state.pageGate.promise; }
       if (action === 'resolve' && state.resolveGate) { state.resolving.resolve(); await state.resolveGate.promise; }
+      if (action === 'extract' && state.extractGate) { state.extracting.resolve(); await state.extractGate.promise; }
       let result;
       if (action === 'probe') result = { ready: true, username };
+      else if (action === 'extract') result = { ok: true, media: { shortcode: value.args[0], username: 'host_creator',
+        pageUrl: `https://www.instagram.com/reel/${value.args[0]}/`, url: 'https://scontent.cdninstagram.com/single.mp4' } };
       else if (!fixtureProfile) result = { ok: false, error: { code: 'PROFILE_UNAVAILABLE', message: 'Profile unavailable' } };
       else if (action === 'identify') result = { ok: true, profile: fixtureProfile.profile };
       else if (action === 'page') {
@@ -94,6 +103,7 @@ function fixture(options = {}) {
         const id = state.downloads.length + 1;
         state.downloads.push({ id, filename: value.filename, byExtensionId: extensionId, url: value.url, finalUrl: value.url,
           state: state.downloadInProgress ? 'in_progress' : 'complete', fileSize: 2048, exists: true, mime: 'video/mp4', startTime: new Date().toISOString() });
+        if (state.downloadGate) { state.accepting.resolve(); await state.downloadGate.promise; }
         if (state.failLedgerAfterAcceptance) { state.failLedgerAfterAcceptance = false; backend.state.failWrite = true; }
         return id;
       },
@@ -219,6 +229,7 @@ test('mixed profile limits enforce the shared cap as 25, 10, 25 with remaining e
   assert.equal(f.state.sourceCalls.some(call => call.username === 'delta'), false);
   const report = await f.queue('REPORT', { runId: run.id }); assert.equal(report.ok, true);
   assert.equal(report.report.profiles[2].report.maxNewVideos, null); assert.equal(report.report.profiles[2].report.sourceExhausted, false);
+  assert.equal(report.report.profiles[2].report.completionReason, 'queue_limit_reached', 'an Unlimited profile stops because the shared queue cap was reached');
   const serialized = JSON.stringify(report.report);
   assert.equal(serialized.includes('signature='), false); assert.equal(serialized.includes('https:'), false);
 });
@@ -306,7 +317,9 @@ test('a late discovery result cannot register the old profile after handoff to t
   run = await finish(f, run, job, { state: 'completed', completionReason: 'feed_exhausted' });
   delete f.state.pageGate; const next = await startEntry(f, run);
   gate.resolve(); const stale = await pendingPage; assert.equal(stale.ok, false);
-  assert.equal((await f.queue('PROGRESS', { runId: run.id, entryId: run.entries[0].id, jobId: job.jobId, snapshot: { jobId: job.jobId, items: [] } })).error.code, 'STALE_JOB');
+  const beforeReplay = await f.store.getRun(run.id);
+  assert.equal((await f.queue('PROGRESS', { runId: run.id, entryId: run.entries[0].id, jobId: job.jobId, snapshot: { jobId: job.jobId, items: [] } })).ok, true);
+  assert.deepEqual(await f.store.getRun(run.id), beforeReplay, 'archived progress acknowledgement must not edit either profile');
   assert.equal(f.state.session[BULK_ACTIVE].jobId, next.job.jobId);
   assert.equal(Object.keys(f.state.session).some(key => key.startsWith(`reel-saver:bulk:${job.jobId}:member:`)), false);
 });
@@ -399,4 +412,106 @@ test('an accepted browser ID survives queue-ledger failure even with another rap
   const retried = await f.bulk('DOWNLOAD', job, { item, attemptId: 'retry-accepted' });
   assert.equal(retried.ok, true, JSON.stringify(retried)); assert.equal(retried.download.id, 2);
   assert.equal(f.state.downloads.length, 2); assert.equal((await f.store.getRun(run.id)).committedNewSaves, 1);
+});
+
+test('replaying ENTRY_START returns the same child without another source navigation', async () => {
+  const f = fixture(), run = await start(f);
+  const first = await startEntry(f, run), calls = f.state.sourceCalls.length;
+  const replay = await f.queue('ENTRY_START', { runId: run.id, entryId: run.entries[0].id });
+  assert.equal(replay.ok, true); assert.equal(replay.job.jobId, first.job.jobId);
+  assert.equal(f.state.createdTabs.length, 1); assert.equal(f.state.sourceCalls.length, calls);
+  assert.equal(f.state.session[QUEUE_OWNER].childJobId, first.job.jobId);
+});
+
+test('lost ENTRY_FINISH acknowledgement can be replayed after the next profile starts', async () => {
+  const f = fixture(); let run = await start(f); const original = run, first = await startEntry(f, run);
+  run = await finish(f, run, first.job); const next = await startEntry(f, run), before = await f.store.getRun(run.id);
+  const replay = await f.queue('ENTRY_FINISH', { runId: run.id, entryId: original.entries[0].id, jobId: first.job.jobId,
+    summary: { state: 'completed', completionReason: 'profile_limit_reached' } });
+  assert.equal(replay.ok, true); assert.deepEqual(await f.store.getRun(run.id), before);
+  assert.equal(f.state.session[BULK_ACTIVE].jobId, next.job.jobId);
+  assert.equal(f.state.session[QUEUE_OWNER].childJobId, next.job.jobId);
+});
+
+test('ENTRY_FINISH retries the handoff if its profile result committed before the ownership write failed', async () => {
+  const f = fixture(), run = await start(f), first = await startEntry(f, run);
+  assert.equal((await f.bulk('END', first.job, { state: 'completed' })).ok, true);
+  f.state.failSessionWrite = true;
+  const message = { runId: run.id, entryId: run.entries[0].id, jobId: first.job.jobId,
+    summary: { state: 'completed', completionReason: 'feed_exhausted' } };
+  const failed = await f.queue('ENTRY_FINISH', message);
+  assert.equal(failed.ok, false); assert.equal(failed.error.code, 'STORAGE_FAILED');
+  assert.equal((await f.store.getRun(run.id)).entries[0].state, 'completed');
+  const retried = await f.queue('ENTRY_FINISH', message);
+  assert.equal(retried.ok, true); assert.equal(retried.run.currentIndex, 1);
+  assert.equal(f.state.session[QUEUE_OWNER].childJobId, null);
+  assert.equal((await startEntry(f, retried.run)).job.profile.username, 'beta');
+});
+
+test('lost Skip and Stop acknowledgements cannot skip or cancel the next profile', async () => {
+  const f = fixture(), run = await start(f), first = await startEntry(f, run);
+  const skipped = await f.queue('SKIP', { runId: run.id, entryId: run.entries[0].id });
+  assert.equal(skipped.ok, true); const next = await startEntry(f, skipped.run), before = await f.store.getRun(run.id);
+  const skipReplay = await f.queue('SKIP', { runId: run.id, entryId: run.entries[0].id });
+  assert.equal(skipReplay.ok, true); assert.deepEqual(await f.store.getRun(run.id), before);
+  assert.equal(f.state.session[BULK_ACTIVE].jobId, next.job.jobId);
+  const stopped = await f.queue('STOP', { runId: run.id }); assert.equal(stopped.ok, true);
+  const stopReplay = await f.queue('STOP', { runId: run.id });
+  assert.equal(stopReplay.ok, true); assert.deepEqual(stopReplay.run, stopped.run);
+  assert.equal(f.state.session[QUEUE_OWNER].active, false); assert.equal(first.job.profile.username, 'alpha');
+});
+
+test('Skip retries advancement if its row committed before restoring running ownership failed', async () => {
+  const f = fixture(), run = await start(f); await startEntry(f, run);
+  f.state.failOwnerWriteNumber = f.state.ownerWrites + 2;
+  const message = { runId: run.id, entryId: run.entries[0].id };
+  const failed = await f.queue('SKIP', message); assert.equal(failed.ok, false); assert.equal(failed.error.code, 'STORAGE_FAILED');
+  assert.equal((await f.store.getRun(run.id)).entries[0].state, 'skipped');
+  const retried = await f.queue('SKIP', message);
+  assert.equal(retried.ok, true); assert.equal(retried.run.currentIndex, 1);
+  assert.equal(f.state.session[QUEUE_OWNER].control, 'running'); assert.equal(f.state.session[QUEUE_OWNER].childJobId, null);
+});
+
+test('mutation leases release after document loss and stale cleanup preserves a newer document lease', async () => {
+  const f = fixture(); const lease = await f.queue('LEASE_BEGIN', { kind: 'clear' }); assert.equal(lease.ok, true);
+  await f.chrome.tabs.remove(hostId); await cleanupProfileQueueTab(hostId, { closed: true });
+  assert.equal(f.state.session[MUTATION_OWNER], undefined);
+  f.state.tabs.set(hostId, { id: hostId, url: hostUrl, status: 'complete', documentId: 'new-host-document', autoDiscardable: true });
+  const nextSender = sender(hostId, 'new-host-document');
+  const next = await f.queue('LEASE_BEGIN', { kind: 'single' }, nextSender); assert.equal(next.ok, true);
+  await cleanupProfileQueueTab(hostId, { status: 'loading' });
+  assert.equal(f.state.session[MUTATION_OWNER].leaseId, next.leaseId);
+  assert.equal((await f.queue('LEASE_END', { leaseId: lease.leaseId }, sender())).ok, false);
+  assert.equal(f.state.session[MUTATION_OWNER].leaseId, next.leaseId);
+  assert.equal((await f.queue('LEASE_END', { leaseId: next.leaseId }, nextSender)).ok, true);
+});
+
+let backgroundSerial = 0;
+async function background() { return import(`../src/background/background.js?queue-integration=${++backgroundSerial}`); }
+function reelTab(f) {
+  const url = 'https://www.instagram.com/reel/B/';
+  f.state.tabs.set(8, { id: 8, url, status: 'complete', autoDiscardable: true, documentId: 'reel-document' });
+  return { id: extensionId, url: `chrome-extension://${extensionId}/src/popup/popup.html` };
+}
+
+test('a queue that starts during an ordinary Reel lookup prevents its late Chrome acceptance', async () => {
+  const extracting = deferred(), gate = deferred(); const f = fixture({ extracting, extractGate: gate });
+  const popup = reelTab(f), api = await background();
+  const downloading = api.handleMessage({ type: 'REEL_SAVER_DOWNLOAD', tabId: 8, shortcode: 'B' }, popup);
+  await extracting.promise; const run = await start(f);
+  gate.resolve(); const refused = await downloading;
+  assert.equal(refused.ok, false); assert.equal(f.state.downloads.length, 0);
+  assert.equal(f.state.session[QUEUE_OWNER].runId, run.id); assert.equal(f.state.session[QUEUE_OWNER].active, true);
+});
+
+test('queue Start waits for an ordinary Chrome acceptance and refuses its still-running download', async () => {
+  const accepting = deferred(), gate = deferred(); const f = fixture({ accepting, downloadGate: gate, downloadInProgress: true });
+  const popup = reelTab(f), api = await background();
+  const downloading = api.handleMessage({ type: 'REEL_SAVER_DOWNLOAD', tabId: 8, shortcode: 'B' }, popup);
+  await accepting.promise;
+  const starting = f.queue('START', { draft: draft(), options: { destination: 'downloads', skipExisting: true } });
+  gate.resolve(); assert.equal((await downloading).ok, true);
+  const refused = await starting; assert.equal(refused.ok, false); assert.equal(refused.error.code, 'JOB_BUSY');
+  assert.equal(await f.store.getLatest(), null); assert.equal(f.state.session[QUEUE_OWNER], undefined);
+  assert.equal(f.state.downloads.length, 1);
 });

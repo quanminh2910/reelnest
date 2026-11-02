@@ -1,6 +1,6 @@
 import { extractReel } from "../instagram/extractor.js";
 import { handleBulkMessage, isBulkMessage, cleanupBulkTab, withJobRegistration } from "./bulk-background.js";
-import { handleProfileQueueMessage, isProfileQueueMessage, cleanupProfileQueueTab } from "./profile-queue-background.js";
+import { handleProfileQueueMessage, isProfileQueueMessage, cleanupProfileQueueTab, cleanupMutationLease } from "./profile-queue-background.js";
 import { assertNoProfileQueue } from "./profile-queue-owner.js";
 import {
   ReelError, parseReelUrl, validateMedia, publicMedia, buildFilename, summarizeDownload,
@@ -232,6 +232,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated?.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "complete") cleanupMutationLease(tabId).catch(() => {});
   if (changeInfo.status === "loading" || changeInfo.discarded === true) {
     cleanupBulkTab(tabId).catch(() => {});
     cleanupProfileQueueTab(tabId, changeInfo).catch(() => {});

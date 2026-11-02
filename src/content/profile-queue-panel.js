@@ -96,12 +96,13 @@
     function notify() { render(); onBusyChange(); }
     function message(text, tone = "neutral") { messageText = text; messageTone = tone; render(); }
     function accept(next) {
-      if (!next) return;
+      if (!next) return false;
       if (run && (next.id || next.runId) === (run.id || run.runId)) {
-        if (Number.isSafeInteger(next.revision) && Number.isSafeInteger(run.revision)) { if (next.revision < run.revision) return; }
-        else if (next.updatedAt && run.updatedAt && next.updatedAt < run.updatedAt) return;
+        if (Number.isSafeInteger(next.revision) && Number.isSafeInteger(run.revision)) { if (next.revision < run.revision) return false; }
+        else if (next.updatedAt && run.updatedAt && next.updatedAt < run.updatedAt) return false;
       }
       run = next;
+      return true;
     }
     const runId = () => run?.id || run?.runId;
     function validDraft() {
@@ -400,14 +401,20 @@
       catch (cause) { message(asError(cause), "error"); return; }
       const target = getDestination();
       if (!["folder", "downloads"].includes(target.kind) || target.kind === "folder" && !target.handle) { message("Choose a library folder or Browser Downloads for the queue.", "error"); return; }
-      const permission = target.kind === "folder" && typeof target.handle.requestPermission === "function" ? target.handle.requestPermission({ mode: "readwrite" }) : Promise.resolve("granted");
+      let permission;
+      try { permission = target.kind === "folder" && typeof target.handle.requestPermission === "function" ? target.handle.requestPermission({ mode: "readwrite" }) : Promise.resolve("granted"); }
+      catch (cause) { message(asError(cause), "error"); return; }
       const previousRunId = runId();
       starting = true; notify();
       try {
         if (await permission !== "granted") throw new Error("Allow access to the selected library folder before starting.");
         await saveTail;
+        const latest = await request({ type: M + "LATEST" });
+        accept(latest.run);
         await recoverInterrupted(target);
-        const response = await request({ type: M + "START", draft: next, options: { destination: target.kind, skipExisting: getSkipExisting() !== false } });
+        const interruptedStart = latest.owned && latest.run?.state === "running" && latest.run.entries.every(entry => entry.state === "pending") &&
+          latest.run.options?.destination === target.kind && latest.run.options.skipExisting === (getSkipExisting() !== false) && JSON.stringify(latest.run.draft) === JSON.stringify(next);
+        const response = interruptedStart ? { run: latest.run } : await request({ type: M + "START", draft: next, options: { destination: target.kind, skipExisting: getSkipExisting() !== false } });
         accept(response.run); ownsRun = true; startedHere = true; desired = null; hostUrl = location.href; navigating = false;
         destination = { ...target, skipExisting: getSkipExisting() !== false }; latestSnapshot = null;
         onActivity?.(`queue-${runId()}`, `Queue started · ${next.entries.length} profiles`, "saving");
@@ -417,7 +424,8 @@
           try {
             const latest = await request({ type: M + "LATEST" });
             if (latest.owned && latest.run && (latest.run.id || latest.run.runId) !== previousRunId && latest.run.state === "running" &&
-                latest.run.entries.every(entry => entry.state === "pending") && JSON.stringify(latest.run.draft) === JSON.stringify(next)) {
+                latest.run.entries.every(entry => entry.state === "pending") && latest.run.options?.destination === target.kind &&
+                latest.run.options.skipExisting === (getSkipExisting() !== false) && JSON.stringify(latest.run.draft) === JSON.stringify(next)) {
               accept(latest.run); ownsRun = true; startedHere = true; desired = null; hostUrl = location.href; navigating = false;
               destination = { ...target, skipExisting: getSkipExisting() !== false }; latestSnapshot = null;
               message("The queue started. Continuing after its response was interrupted.");
@@ -491,8 +499,10 @@
     });
     resume.addEventListener("click", async event => {
       if (!event.isTrusted || !ownsRun || controlPending) return;
-      const permission = destination?.kind === "folder" && typeof destination.handle?.requestPermission === "function"
-        ? destination.handle.requestPermission({ mode: "readwrite" }) : Promise.resolve("granted");
+      let permission;
+      try { permission = destination?.kind === "folder" && typeof destination.handle?.requestPermission === "function"
+        ? destination.handle.requestPermission({ mode: "readwrite" }) : Promise.resolve("granted"); }
+      catch (cause) { message(asError(cause), "error"); return; }
       controlPending = true; notify();
       try {
         if (hostUrl !== location.href) throw new Error("Return to the original control page before resuming the queue.");
@@ -537,7 +547,9 @@
       if (!event.isTrusted || busy() || isSingleBusy() || !runId()) return;
       const target = getDestination();
       if (target.kind !== run.options?.destination || target.kind === "folder" && !target.handle) { message("Select the original destination before retrying failed items.", "error"); return; }
-      const permission = target.kind === "folder" && typeof target.handle.requestPermission === "function" ? target.handle.requestPermission({ mode: "readwrite" }) : Promise.resolve("granted");
+      let permission;
+      try { permission = target.kind === "folder" && typeof target.handle.requestPermission === "function" ? target.handle.requestPermission({ mode: "readwrite" }) : Promise.resolve("granted"); }
+      catch (cause) { message(asError(cause), "error"); return; }
       starting = true; notify();
       try {
         if (await permission !== "granted") throw new Error("Allow access to the library folder before retrying.");
@@ -567,7 +579,7 @@
     }
     function handleEvent(next) {
       if (!ownsRun || !next || (next.id || next.runId) !== runId()) return;
-      accept(next);
+      if (!accept(next)) return;
       if (next.state === "paused") {
         desired = "pause";
         pauseRunner(next.error?.message || "Queue paused.");

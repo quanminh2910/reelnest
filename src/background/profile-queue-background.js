@@ -3,7 +3,7 @@ import "../shared/profile-queue-config.js";
 import { profileSource } from "../instagram/profile-source.js";
 import { queueStore } from "./profile-queue-store.js";
 import { getQueueRecovery, reconcileQueue } from "./profile-queue-recovery.js";
-import { withJobRegistration, startQueueChild, rebindQueueChild, handleBulkMessage } from "./bulk-background.js";
+import { withJobRegistration, startQueueChild, rebindQueueChild, handleBulkMessage, interruptQueueChild } from "./bulk-background.js";
 import { QUEUE_OWNER, MUTATION_OWNER, BULK_ACTIVE, readQueueOwner, readMutationOwner, queueProblem as problem } from "./profile-queue-owner.js";
 
 const config = globalThis.ReelNestProfileQueueConfig;
@@ -251,7 +251,8 @@ async function progress(ctx, message) {
   const snapshot = message.snapshot;
   if (!snapshot || snapshot.jobId !== message.jobId || !Array.isArray(snapshot.items) || snapshot.items.length > 50_000) throw problem("INVALID_RESULT", "The profile progress is invalid.");
   await queueStore.recordItems(message.runId, message.entryId, snapshot.items);
-  const updated = await queueStore.updateEntry(message.runId, message.entryId, { phase: snapshot.phase, sourceExhausted: snapshot.sourceExhausted === true });
+  const updated = await queueStore.updateEntry(message.runId, message.entryId, { phase: snapshot.phase,
+    sourceExhausted: owner.retryPass ? entry.sourceExhausted : snapshot.sourceExhausted === true });
   return { ok: true, run: updated };
 }
 
@@ -259,14 +260,21 @@ async function finishEntry(ctx, message, reason) {
   const owner = await current(ctx, message.runId, { inactive: true });
   const previousRun = await queueStore.getRun(message.runId);
   const previousEntry = previousRun.entries.find(value => value.id === message.entryId);
-  if (previousEntry?.childJobId === message.jobId && ["completed", "completed_with_errors", "skipped", "stopped"].includes(previousEntry.state)) return { ok: true, run: previousRun };
+  if (previousEntry?.childJobId === message.jobId && ["completed", "completed_with_errors", "skipped", "stopped"].includes(previousEntry.state)) {
+    if (previousRun.entries[previousRun.currentIndex]?.id !== previousEntry.id || !owner.active) return { ok: true, run: previousRun };
+    await saveOwner({ ...owner, childJobId: null });
+    return { ok: true, run: terminals.has(previousRun.state)
+      ? await finishRun(ctx, previousRun, previousRun.completionReason || "feed_exhausted", previousRun.state)
+      : await advance(ctx, previousRun) };
+  }
   if (owner.entryId !== message.entryId || owner.childJobId !== message.jobId) throw problem("STALE_JOB", "This profile has already been released.");
   const bulk = (await chrome.storage.session.get(BULK_ACTIVE))[BULK_ACTIVE];
   if (bulk?.jobId === message.jobId && (bulk.active || bulk.reservationMediaId)) throw problem("RECONCILIATION_REQUIRED", "Release the current profile and record its saved files before advancing.");
   const summary = message.summary || {};
-  const snapshotReason = reason || summary.completionReason || "feed_exhausted";
+  const snapshotReason = previousRun.draft.totalLimit != null && previousRun.committedNewSaves >= previousRun.draft.totalLimit
+    ? "queue_limit_reached" : reason || summary.completionReason || "feed_exhausted";
   const run = await queueStore.finishEntry(message.runId, message.entryId, { state: reason === "user_skipped" ? "skipped" : summary.state === "completed_with_errors" ? "completed_with_errors" : "completed",
-    completionReason: snapshotReason, sourceExhausted: summary.sourceExhausted === true, endedAt: Date.now() });
+    completionReason: snapshotReason, sourceExhausted: owner.retryPass ? previousEntry.sourceExhausted : summary.sourceExhausted === true, endedAt: Date.now() });
   await saveOwner({ ...owner, childJobId: null });
   return { ok: true, run: await advance(ctx, run) };
 }
@@ -275,7 +283,13 @@ async function control(ctx, message, action, sender) {
   const initial = await current(ctx, message.runId, { inactive: true });
   const before = await queueStore.getRun(message.runId);
   if (action === "STOP" && !initial.active && terminals.has(before.state)) return { ok: true, run: before };
-  if (action === "SKIP" && message.entryId && (before.entries[before.currentIndex]?.id !== message.entryId || before.entries[before.currentIndex]?.state === "skipped")) return { ok: true, run: before };
+  if (action === "SKIP" && message.entryId && before.entries[before.currentIndex]?.id !== message.entryId) return { ok: true, run: before };
+  if (action === "SKIP" && before.entries[before.currentIndex]?.state === "skipped") {
+    if (!initial.active) return { ok: true, run: before };
+    await saveOwner({ ...initial, childJobId: null, control: "running" });
+    const repaired = await queueStore.updateRun(before.id, { state: "running" });
+    return { ok: true, run: await advance(ctx, repaired) };
+  }
   let owner = await ownerMutation(async () => {
     const old = await current(ctx, message.runId);
     return writeOwner({ ...old, control: action === "RESUME" ? "running" : action === "PAUSE" ? "paused" : "stopping", epoch: old.epoch + 1 });
@@ -317,7 +331,7 @@ async function control(ctx, message, action, sender) {
   }
 }
 
-export async function cleanupProfileQueueTab(tabId, change = {}) {
+export async function cleanupMutationLease(tabId) {
   await withJobRegistration(async () => {
     const lease = await readMutationOwner();
     if (lease?.tabId !== tabId) return;
@@ -325,10 +339,15 @@ export async function cleanupProfileQueueTab(tabId, change = {}) {
     const frames = tab ? await chrome.scripting.executeScript({ target: { tabId }, func: () => true }).catch(() => []) : [];
     if (!tab || frames.find(frame => frame.frameId === 0)?.documentId !== lease.documentId) await chrome.storage.session.remove(MUTATION_OWNER);
   });
+}
+
+export async function cleanupProfileQueueTab(tabId, change = {}) {
+  await cleanupMutationLease(tabId);
   const owner = await readQueueOwner();
   if (!owner?.active) return;
   if (tabId === owner.tabId) {
     await saveOwner({ ...owner, active: false, control: "stopped", epoch: owner.epoch + 1 });
+    if (owner.childJobId) await interruptQueueChild(owner.childJobId);
     await queueStore.updateRun(owner.runId, { state: "interrupted", completionReason: "host_lost", endedAt: Date.now() });
     await closeSource(owner);
   } else if (tabId === owner.sourceTabId && !owner.navigating) {

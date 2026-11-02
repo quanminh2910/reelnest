@@ -41,10 +41,13 @@ const fixture = `(() => {
       state.requests.push(clone(message));
       if(message.type==='REEL_SAVER_SETTINGS_GET')return ok({settings:{destination:'downloads'}});
       if(message.type==='REEL_SAVER_SETTINGS_SET')return ok({settings:message.settings});
-      if(message.type==='REEL_SAVER_INSPECT')return{ok:false,error:{code:'NOT_REEL',message:'Open a Reel to download it here.'}};
+      if(message.type==='REEL_SAVER_INSPECT')return state.singleMedia?ok({media:clone(state.singleMedia)}):{ok:false,error:{code:'NOT_REEL',message:'Open a Reel to download it here.'}};
+      if(message.type==='REEL_SAVER_RESOLVE')return ok({media:clone(state.singleMedia),filename:'creator_a_'+state.singleMedia.shortcode+'.mp4'});
       if(message.type==='REEL_SAVER_BULK_SETTINGS_GET')return ok({settings:{mode:'batches',batchSize:35,maxNewVideos:null}});
       const action=message.type.replace('REEL_SAVER_QUEUE_','');
       if(action==='DRAFT_GET')return ok({draft:state.draft||undefined});
+      if(action==='LEASE_BEGIN'){state.singleLease=true;if(state.failLeaseAck){state.failLeaseAck=false;throw new Error('Lease acknowledgement lost');}return ok({leaseId:'single-fixture-lease'});}
+      if(action==='LEASE_END'){state.singleLease=false;return ok({});}
       if(action==='DRAFT_SET'){state.draft=clone(message.draft);return ok({draft:state.draft});}
       if(action==='LATEST')return ok({run:clone(state.run)});
       if(action==='START'){
@@ -135,7 +138,7 @@ try {
   const shadow = "document.querySelector('[data-reel-saver-panel]').shadowRoot";
   const query = selector => `${shadow}.querySelector(${JSON.stringify(selector)})`;
   const role = name => query(`[data-role=${name}]`);
-  async function wait(expression, title) { for (let n = 0; n < 150; n++) { if (await evaluate(expression)) return; await new Promise(resolve => setTimeout(resolve, 50)); } throw new Error(`Timed out: ${title}. ${JSON.stringify(errors)} ${await evaluate(`${role('queue-status')}?.textContent`)}`); }
+  async function wait(expression, title) { for (let n = 0; n < 150; n++) { if (await evaluate(expression)) return; await new Promise(resolve => setTimeout(resolve, 50)); } throw new Error(`Timed out: ${title}. ${JSON.stringify(errors)} ${await evaluate(`JSON.stringify({status:${role('queue-status')}?.textContent,input:${role('queue-input')}?.value,selected:${role('profile-queue-view')}?.getAttribute('aria-selected'),disabled:${role('queue-add')}?.disabled,requests:window.__queueFixture.requests.slice(-5).map(n=>n.type)})`)}`); }
   async function click(expression) {
     const position = await evaluate(`(()=>{const n=${expression};n.scrollIntoView({block:'center'});const b=n.getBoundingClientRect();return{x:b.x+b.width/2,y:b.y+b.height/2}})()`);
     await page('Input.dispatchMouseEvent', { type: 'mouseMoved', ...position });
@@ -151,6 +154,7 @@ try {
   await click("document.querySelector('[data-reel-saver-launcher]').shadowRoot.querySelector('button')");
   await wait(`${role('profile-queue-view')} && !${role('destination')}.disabled`, 'loaded controls');
   await click(role('profile-queue-view'));
+  await wait(`!${role('queue-input')}.disabled`, 'loaded queue draft');
   await fill(role('queue-input'), '@creator_a\nhttps://www.instagram.com/creator_b/reels/\n@creator_c\nhttps://example.com/invalid');
   await click(role('queue-add'));
   await wait(`${role('queue-draft')}.children.length===3`, 'valid profiles retained');
@@ -192,6 +196,19 @@ try {
   assert.equal(await evaluate('window.__queueFixture.pickerCalls'), 1);
   assert.equal(await evaluate(`${role('queue-results')}.children.length`), 3);
   console.log('PASS Browser Downloads queue uses the same caps and serial runner without another folder selection');
+
+  await select(role('destination'), 2);
+  await evaluate(`(()=>{const state=window.__queueFixture;state.singleMedia={mediaId:'100003',shortcode:'Yaj',username:'creator_a',ownerProfile:{id:'12345',username:'creator_a'},url:'https://scontent.cdninstagram.com/Yaj.mp4',width:32,height:32};state.failLeaseAck=true;history.pushState({},'', '/reel/Yaj/');window.dispatchEvent(new PopStateEvent('popstate'));})()`);
+  await click(role('current-profile-view'));
+  await wait(`!${role('download')}.disabled`, 'single Reel controls');
+  const beforeSingle = await evaluate('window.__queueFixture.writes');
+  await click(role('download'));
+  await wait(`!${role('download')}.disabled && !window.__queueFixture.singleLease`, 'lost lease acknowledgement safely released');
+  assert.equal(await evaluate('window.__queueFixture.writes'), beforeSingle);
+  assert.ok(await evaluate("window.__queueFixture.requests.some(m=>m.type==='REEL_SAVER_QUEUE_LEASE_END'&&m.kind==='single'&&!m.leaseId)"));
+  await click(role('download'));
+  await wait(`!${role('download')}.disabled && !window.__queueFixture.singleLease && window.__queueFixture.writes===${beforeSingle + 1}`, 'single save after lease recovery');
+  console.log('PASS native single download recovers a lost ownership acknowledgement before saving and releases the shared queue lease');
   assert.deepEqual(errors, []);
   console.log('PASS trusted start, invalid-input feedback, shared destination locking and latest result rendering without uncaught errors');
 } finally {

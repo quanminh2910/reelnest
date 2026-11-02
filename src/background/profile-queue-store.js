@@ -445,6 +445,10 @@ export function createQueueStore({ backend = createIndexedDBBackend(), now = Dat
         const records = await tx.listItems(run.id, entry.id);
         for (const raw of records) {
           const previous = checkedRecord(run, entry, raw);
+          if (reason === 'queue_limit_reached' && previous.state === 'deferred') {
+            await putItem(tx, run, entry, previous, { ...previous, reason });
+            continue;
+          }
           if (!['queued', 'resolving', 'saving', 'unknown'].includes(previous.state)) continue;
           const deferred = ['profile_limit_reached', 'queue_limit_reached'].includes(reason);
           await putItem(tx, run, entry, previous, { ...previous, state: deferred ? 'deferred' : 'canceled', reason });

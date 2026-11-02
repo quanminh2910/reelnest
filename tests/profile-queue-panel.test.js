@@ -53,6 +53,15 @@ async function fixture(extra = {}) {
     if (action === 'DRAFT_GET') return { draft: plain(state.draft) };
     if (action === 'DRAFT_SET') { state.draft = plain(message.draft); return { draft: plain(state.draft) }; }
     if (action === 'LATEST') return { run: plain(state.run), owned: state.owned === true };
+    if (action === 'LEASE_BEGIN') { state.recoveryLeased = true; return { leaseId: 'recovery-lease' }; }
+    if (action === 'LEASE_END') { state.recoveryLeased = false; return {}; }
+    if (action === 'RECOVERY_INFO') return { recovery: state.run.reservation ? { run: plain(state.run), entry: plain(state.run.entries[0]), item: plain(state.recoveryItem) } : null };
+    if (action === 'RECONCILE') {
+      assert.equal(state.recoveryLeased, true); state.recoveryProof = message.result === undefined ? null : plain(message.result);
+      state.run.reservation = null;
+      if (state.failRecoveryAck) { state.failRecoveryAck--; throw new Error('Recovery acknowledgement lost'); }
+      return { run: current() };
+    }
     if (action === 'START') {
       state.run = { id: 'run-one', state: 'running', currentIndex: 0, committedNewSaves: 0, draft: plain(message.draft), options: plain(message.options),
         entries: message.draft.entries.map(value => ({ ...plain(value), state: 'pending', effectiveLimit: value.limitMode === 'custom' ? value.maxNewVideos : value.limitMode === 'unlimited' ? null : message.draft.defaultLimit,
@@ -100,6 +109,14 @@ async function fixture(extra = {}) {
   const context = vm.createContext({ setTimeout: timers, clearTimeout, Blob, URL: { createObjectURL: () => 'blob:fixture', revokeObjectURL() {} },
     crypto: { randomUUID: () => `new-${++clock}` }, location: { href: 'https://www.instagram.com/control/reels/' },
     CSSStyleSheet: class { replaceSync() {} }, document: { createElement: node },
+    ReelSaverProfileCache: { async openLibrary(target, profile, options) {
+      state.recoveryCacheOpens = (state.recoveryCacheOpens || 0) + 1;
+      assert.equal(options?.existingOnly, true);
+      if (state.wrongRecoveryRoot) throw Object.assign(new Error('Choose the original library'), { code: 'CACHE_RECONCILIATION_REQUIRED' });
+      return { async verifyItem() { return state.recoverySaved || null; },
+        directoryHandle: { async getFileHandle() { if (!state.recoveryFilePresent) throw Object.assign(new Error('Not found'), { name: 'NotFoundError' }); return {}; } },
+        close() { state.recoveryCacheClosed = (state.recoveryCacheClosed || 0) + 1; } };
+    } },
     ReelNestProfileJobRunner: { async create({ job, onChange }) {
       const number = job.profile.id === '123' ? 1 : 10;
       let value = { jobId: job.jobId, profile: job.profile, state: 'idle', phase: 'downloading', sourceExhausted: false,
@@ -139,7 +156,7 @@ async function fixture(extra = {}) {
   for (const source of sources) vm.runInContext(source, context);
   const root = node('root');
   const panel = context.ReelNestProfileQueuePanel.create({ root, request, readRoute: () => ({ type: 'profile', username: 'control' }),
-    getDestination: () => ({ kind: 'downloads' }), onBusyChange() {} });
+    getDestination: () => state.destination || ({ kind: 'downloads' }), onBusyChange() {} });
   const role = value => walk(panel.element, entry => entry.dataset.role === value);
   await panel.load();
   return { context, state, panel, role };
@@ -258,6 +275,10 @@ test('source lifecycle events pause only the currently owned queue', async () =>
   await until(() => f.state.runners.length === 1, 'active child');
   f.panel.handleEvent({ ...plain(f.state.run), id: 'other-run', state: 'paused', error: { message: 'Wrong queue' } });
   assert.equal(f.state.runners[0].snapshot().state, 'running');
+  f.state.run.revision = 10;
+  f.panel.handleEvent(plain(f.state.run));
+  f.panel.handleEvent({ ...plain(f.state.run), revision: 9, state: 'paused', error: { message: 'Stale event' } });
+  assert.equal(f.state.runners[0].snapshot().state, 'running', 'an older lifecycle revision cannot pause a resumed run');
   f.state.run.state = 'paused';
   f.panel.handleEvent({ ...plain(f.state.run), state: 'paused', error: { message: 'Source tab closed' } });
   f.state.transferWait.resolve();
@@ -265,4 +286,66 @@ test('source lifecycle events pause only the currently owned queue', async () =>
   assert.equal(f.state.calls.includes('source:b'), false);
   await f.role('queue-stop').event('click');
   await until(() => !f.panel.isBusy(), 'cleanup');
+});
+
+function interruptedFolder(extra = {}) {
+  return { run: { id: 'interrupted-run', state: 'interrupted', revision: 1, currentIndex: 0, committedNewSaves: 0,
+    options: { destination: 'folder', skipExisting: true }, reservation: { entryId: 'a', mediaId: '1', attemptId: 'old-attempt' },
+    entries: [{ id: 'a', username: 'creator_a', profile: { id: '123', username: 'creator_a' }, state: 'running', committedNewSaves: 0, counts: {} }] },
+    recoveryItem: { mediaId: '1', shortcode: 'B', state: 'unknown', filename: 'creator_B (1).mp4' },
+    destination: { kind: 'folder', handle: { name: 'Original library' } }, ...extra };
+}
+
+test('a new queue reconciles an interrupted folder save from its exact verified cache result before Start', async () => {
+  const f = await fixture(interruptedFolder({ recoverySaved: { filename: 'creator_B (1).mp4', bytesWritten: 2048 } }));
+  await f.role('queue-start').event('click');
+  await until(() => !f.panel.isBusy(), 'recovered queue completes');
+  assert.deepEqual(f.state.recoveryProof, { state: 'saved', filename: 'creator_B (1).mp4', bytesWritten: 2048 });
+  assert.equal(f.state.recoveryCacheClosed, 1);
+  const actions = f.state.requests.map(message => message.type);
+  assert.ok(actions.indexOf('REEL_SAVER_QUEUE_RECONCILE') < actions.indexOf('REEL_SAVER_QUEUE_START'));
+  assert.equal(f.state.recoveryLeased, false);
+});
+
+test('an older cached copy cannot prove the new interrupted copy; exact absent output is canceled', async () => {
+  const f = await fixture(interruptedFolder({ recoverySaved: { filename: 'creator_B.mp4', bytesWritten: 2048 } }));
+  await f.role('queue-start').event('click');
+  await until(() => !f.panel.isBusy(), 'queue after absent output');
+  assert.deepEqual(f.state.recoveryProof, { state: 'canceled', filename: 'creator_B (1).mp4' });
+});
+
+test('wrong library or an unverified present output leaves recovery pending without starting a queue', async () => {
+  for (const extra of [{ wrongRecoveryRoot: true }, { recoveryFilePresent: true }]) {
+    const f = await fixture(interruptedFolder(extra));
+    await f.role('queue-start').event('click');
+    assert.equal(f.state.requests.some(message => message.type === 'REEL_SAVER_QUEUE_START'), false);
+    assert.equal(f.state.recoveryProof, undefined);
+    assert.ok(f.state.run.reservation);
+    assert.equal(f.state.recoveryLeased, false);
+  }
+});
+
+test('a lost recovery acknowledgement refreshes authoritative history before the next Start attempt', async () => {
+  const f = await fixture(interruptedFolder({ recoverySaved: { filename: 'creator_B (1).mp4', bytesWritten: 2048 }, failRecoveryAck: 1 }));
+  await f.role('queue-start').event('click');
+  assert.equal(f.state.requests.some(message => message.type === 'REEL_SAVER_QUEUE_START'), false);
+  assert.equal(f.state.run.reservation, null);
+  await f.role('queue-start').event('click');
+  await until(() => !f.panel.isBusy(), 'new run after lost recovery acknowledgement');
+  assert.equal(f.state.requests.filter(message => message.type === 'REEL_SAVER_QUEUE_RECONCILE').length, 1);
+});
+
+test('Chrome recovery and a lookup-only interruption do not open or initialize a library', async () => {
+  for (const destination of ['downloads', 'folder']) {
+    const extra = interruptedFolder({ destination: { kind: 'downloads' } });
+    extra.run.options.destination = destination;
+    if (destination === 'folder') extra.recoveryItem = { mediaId: '1', shortcode: 'B', state: 'resolving' };
+    else extra.recoveryItem.downloadId = 42;
+    const f = await fixture(extra);
+    await f.role('queue-start').event('click');
+    await until(() => !f.panel.isBusy(), 'automatic interrupted-operation check');
+    assert.equal(f.state.recoveryProof, null, 'the worker performs the browser/no-intent proof');
+    assert.equal(f.state.recoveryCacheOpens, undefined);
+    assert.equal(f.state.recoveryLeased, false);
+  }
 });
