@@ -1,5 +1,7 @@
 import { extractReel } from "../instagram/extractor.js";
-import { handleBulkMessage, isBulkMessage, cleanupBulkTab } from "./bulk-background.js";
+import { handleBulkMessage, isBulkMessage, cleanupBulkTab, withJobRegistration } from "./bulk-background.js";
+import { handleProfileQueueMessage, isProfileQueueMessage, cleanupProfileQueueTab } from "./profile-queue-background.js";
+import { assertNoProfileQueue } from "./profile-queue-owner.js";
 import {
   ReelError, parseReelUrl, validateMedia, publicMedia, buildFilename, summarizeDownload,
 } from "../shared/core.js";
@@ -131,11 +133,10 @@ async function startDownload(tabId, shortcode) {
   await currentReel(tabId, shortcode);
   let id;
   try {
-    id = await chrome.downloads.download({
-      url: media.url,
-      filename: buildFilename(media),
-      conflictAction: "uniquify",
-      saveAs: settings.destination === "ask",
+    id = await withJobRegistration(async () => {
+      await assertNoProfileQueue();
+      return chrome.downloads.download({ url: media.url, filename: buildFilename(media),
+        conflictAction: "uniquify", saveAs: settings.destination === "ask" });
     });
   } catch {
     throw new ReelError("DOWNLOAD_FAILED", "Chrome could not start the download. Reload the Reel, then retry.");
@@ -150,6 +151,7 @@ async function startDownload(tabId, shortcode) {
 }
 
 export async function handleMessage(message, sender) {
+  if (isProfileQueueMessage(message)) return handleProfileQueueMessage(message, sender);
   if (isBulkMessage(message)) return handleBulkMessage(message, sender);
   if (!supportedTypes.has(message?.type)) return undefined;
   const context = senderContext(sender, message);
@@ -157,6 +159,7 @@ export async function handleMessage(message, sender) {
     return { ok: false, error: { code: "INVALID_SENDER", message: "Open ReelNest from Instagram or the Chrome toolbar." } };
   }
   try {
+    if (["REEL_SAVER_RESOLVE", "REEL_SAVER_DOWNLOAD"].includes(message.type)) await assertNoProfileQueue();
     if (message.type === "REEL_SAVER_SETTINGS_GET") {
       return { ok: true, settings: await getSettings() };
     }
@@ -205,15 +208,15 @@ export async function handleMessage(message, sender) {
     return {
       ok: false,
       error: {
-        code: error instanceof ReelError ? error.code : "UNEXPECTED_ERROR",
-        message: error instanceof ReelError ? error.message : "Something went wrong. Reopen ReelNest and try again.",
+        code: error instanceof ReelError || error.code === "QUEUE_BUSY" ? error.code : "UNEXPECTED_ERROR",
+        message: error instanceof ReelError || error.code === "QUEUE_BUSY" ? error.message : "Something went wrong. Reopen ReelNest and try again.",
       },
     };
   }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!supportedTypes.has(message?.type) && !isBulkMessage(message)) return false;
+  if (!supportedTypes.has(message?.type) && !isBulkMessage(message) && !isProfileQueueMessage(message)) return false;
   handleMessage(message, sender).then(sendResponse, () => sendResponse({
     ok: false,
     error: { code: "UNEXPECTED_ERROR", message: "Something went wrong. Reopen ReelNest and try again." },
@@ -225,10 +228,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   cache.delete(tabId);
   chrome.storage.session.remove(recordKey(tabId)).catch(() => {});
   cleanupBulkTab(tabId).catch(() => {});
+  cleanupProfileQueueTab(tabId, { closed: true }).catch(() => {});
 });
 
 chrome.tabs.onUpdated?.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" || changeInfo.discarded === true) {
     cleanupBulkTab(tabId).catch(() => {});
+    cleanupProfileQueueTab(tabId, changeInfo).catch(() => {});
   }
 });

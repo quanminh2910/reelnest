@@ -29,6 +29,10 @@
   let mutationTimer;
   let previousFocus;
   let bulkPanel = null;
+  let queuePanel = null;
+  let queueView = "profile";
+  let singleLease = null;
+  let singleCleanup = null;
   const activity = [];
 
   function readRoute() {
@@ -120,6 +124,7 @@
       color:#6c8171;overflow-wrap:anywhere}.activity li[data-state=complete]{color:#34734b}.activity li[data-state=error]{color:#a05a45}
     .empty{margin:0;color:#93a093;font-size:11px}.footer{padding:14px 22px 17px;border-top:1px solid #e1eae3;color:#8b9a8e;
       font-size:10px;background:#fff}.footer strong{color:#6c8473;font-weight:600}
+    .download-views{display:flex;gap:5px;margin-top:22px;padding:4px;background:#eaf2ec;border-radius:9px}.download-views button{flex:1;min-height:36px;border:0;border-radius:6px;background:transparent;color:#486652;font-size:12px;cursor:pointer}.download-views button[aria-selected=true]{background:#fff;color:#224d34;box-shadow:0 1px 4px #173e2c12;font-weight:600}
     @media(max-width:480px){dialog{inset:8px;width:calc(100vw - 16px);height:calc(100dvh - 16px);max-height:calc(100dvh - 16px)}
       header{padding:18px}main{padding:18px}}
   `;
@@ -183,14 +188,33 @@
         ? { kind: "folder", handle: directoryHandle, name: directoryHandle?.name }
         : { kind: selectedDestination },
       getSkipExisting: () => skipAlreadyDownloaded,
-      isSingleBusy: () => !!downloadJob || !!nativeReceipt || inspecting || savingSettings,
+      isSingleBusy: () => !!downloadJob || !!nativeReceipt || !!singleCleanup || !!singleLease || inspecting || savingSettings || !!queuePanel?.isBusy(),
       onBusyChange: () => updateControls(),
       onActivity: appendActivity,
       onLibraryDestination: value => { libraryDestination = value; updateControls(); },
     });
   }
+  if (globalThis.ReelNestProfileQueuePanel) {
+    queuePanel = globalThis.ReelNestProfileQueuePanel.create({
+      root: panelRoot, request, readRoute,
+      getDestination: () => selectedDestination === "chosen"
+        ? { kind: "folder", handle: directoryHandle, name: directoryHandle?.name }
+        : { kind: selectedDestination },
+      getSkipExisting: () => skipAlreadyDownloaded,
+      isSingleBusy: () => !!downloadJob || !!nativeReceipt || !!singleCleanup || !!singleLease || inspecting || savingSettings || !!bulkPanel?.isBusy(),
+      onBusyChange: () => updateControls(), onActivity: appendActivity,
+      onLibraryDestination: value => { libraryDestination = value; updateControls(); },
+    });
+  }
+  const views = el("div", "", { class: "download-views", role: "tablist", "aria-label": "Download controls", hidden: "" });
+  const currentView = el("button", "Current profile", { type: "button", role: "tab", "aria-selected": "true", "data-role": "current-profile-view" });
+  const profilesView = el("button", "Profile queue", { type: "button", role: "tab", "aria-selected": "false", "data-role": "profile-queue-view" });
+  views.append(currentView, profilesView);
+  if (queuePanel) views.hidden = false;
   main.append(context, destinationSection);
+  main.append(views);
   if (bulkPanel) main.append(bulkPanel.element);
+  if (queuePanel) main.append(queuePanel.element);
   main.append(reelSection, activitySection);
   const footer = el("div", "", { class: "footer" });
   footer.append(document.createTextNode("Keep this tab open."));
@@ -204,7 +228,7 @@
   }
 
   function updateControls() {
-    const busy = !!downloadJob || !!nativeReceipt || !!bulkPanel?.isBusy();
+    const busy = !!downloadJob || !!nativeReceipt || !!singleCleanup || !!singleLease || !!bulkPanel?.isBusy() || !!queuePanel?.isBusy();
     destination.value = selectedDestination;
     destination.disabled = !settingsLoaded || busy || savingSettings;
     chooseFolder.disabled = !settingsLoaded || busy || savingSettings || !globalThis.ReelSaverFolderWriter?.isSupported();
@@ -213,9 +237,12 @@
     skipLabel.hidden = selectedDestination === "ask";
     skipExisting.checked = skipAlreadyDownloaded;
     skipExisting.disabled = busy;
-    historyRetry.hidden = historyNotice.hidden = !nativeReceipt;
+    historyRetry.hidden = historyNotice.hidden = !nativeReceipt && !singleCleanup && !singleLease;
     historyRetry.disabled = !!downloadJob;
+    historyRetry.textContent = nativeReceipt ? "Retry history update" : "Release download session";
     if (nativeReceipt) historyNotice.textContent = `${nativeReceipt.result.filename} is saved. Its download history still needs to be recorded. Retry below before starting another download.`;
+    else if (singleCleanup) historyNotice.textContent = "An interrupted folder file still needs cleanup. Resolve the incomplete file, then retry before starting another download.";
+    else if (singleLease) historyNotice.textContent = "The download session still needs to be released. Retry below before starting another download.";
     cancel.hidden = downloadJob?.type !== "native";
     if (!busy) download.textContent = inspecting ? "Finding Reel…" : "Download MP4";
     if (selectedDestination === "chosen") {
@@ -233,6 +260,14 @@
       chooseFolder.title = "This browser does not support choosing a folder here. Use Ask where to save instead.";
     }
     bulkPanel?.update();
+    queuePanel?.update();
+    if (queuePanel) {
+      queuePanel.element.hidden = queueView !== "queue";
+      if (bulkPanel && queueView === "queue") bulkPanel.element.hidden = true;
+      reelSection.hidden = activitySection.hidden = queueView === "queue";
+      currentView.setAttribute("aria-selected", String(queueView === "profile"));
+      profilesView.setAttribute("aria-selected", String(queueView === "queue"));
+    }
   }
 
   function appendActivity(key, label, state) {
@@ -291,6 +326,7 @@
         bulkPanel.loadSettings(bulkSettings.settings || {});
       }
       settingsLoaded = true;
+      if (queuePanel) await queuePanel.load();
     } catch (error) {
       settingsLoaded = false;
       setStatus(friendlyError(error), "error");
@@ -324,7 +360,7 @@
   }
 
   async function refreshCurrentReel() {
-    if (downloadJob || bulkPanel?.isBusy()) return;
+    if (downloadJob || bulkPanel?.isBusy() || queuePanel?.isBusy()) return;
     const version = ++requestVersion;
     clearMedia();
     currentRoute = readRoute();
@@ -407,7 +443,7 @@
 
   async function startDownload(event) {
     if (!event?.isTrusted) return;
-    if (downloadJob || nativeReceipt || bulkPanel?.isBusy() || inspecting || savingSettings || !currentMedia || !settingsLoaded) return;
+    if (downloadJob || nativeReceipt || singleCleanup || singleLease || bulkPanel?.isBusy() || queuePanel?.isBusy() || inspecting || savingSettings || !currentMedia || !settingsLoaded) return;
     const media = currentMedia;
     if (readRoute()?.shortcode !== media.shortcode) {
       await refreshCurrentReel();
@@ -423,6 +459,19 @@
     try {
       if (native) {
         if (!targetDirectory) throw new Error("Choose a library folder before downloading.");
+        if (queuePanel) {
+          singleLease = "pending";
+          try {
+            const lease = await request({ type: "REEL_SAVER_QUEUE_LEASE_BEGIN", kind: "single" });
+            if (!lease.leaseId) throw new Error("The download session could not be reserved. Retry before saving.");
+            singleLease = lease.leaseId;
+          } catch (cause) {
+            // A worker rejection proves the lease was not acquired. A lost
+            // response keeps an unknown lease until its kind can be released.
+            if (cause.code && cause.code !== "JOB_LOST") singleLease = null;
+            throw cause;
+          }
+        }
         nativeController = new AbortController();
         const signal = nativeController.signal;
         let response = null;
@@ -470,7 +519,11 @@
             },
           });
         } catch (error) {
-          if (intentWritten && !error.cleanupFailed) await library.abandonWrite(item);
+          if (intentWritten && !error.cleanupFailed) {
+            try { await library.abandonWrite(item); }
+            catch (cleanupError) { singleCleanup = { cache: library, item, rootHandle: targetDirectory }; throw cleanupError; }
+          }
+          if (intentWritten && error.cleanupFailed) singleCleanup = { cache: library, item, rootHandle: targetDirectory };
           const canceled = error.name === "AbortError" || error.code === "SAVE_CANCELLED";
           appendActivity(key, `${canceled ? "Canceled" : "Failed"} · ${response.filename}`, canceled ? "canceled" : "error");
           throw error;
@@ -492,7 +545,12 @@
       setStatus(nativeReceipt ? "The video is saved, but its history update failed. Use Retry history update; it will not download a second copy." :
         canceled ? "The folder download was canceled." : friendlyError(error), canceled ? "neutral" : "error");
     } finally {
-      if (library && nativeReceipt?.cache !== library) library.close();
+      if (library && nativeReceipt?.cache !== library && singleCleanup?.cache !== library) library.close();
+      if (!nativeReceipt && !singleCleanup && singleLease) {
+        try { await releaseSingleLease(); }
+        catch (cause) { setStatus(`The video operation has ended, but its session could not be released. ${friendlyError(cause)} Retry below before starting another download.`, "error"); }
+      }
+      updateControls();
     }
   }
 
@@ -504,21 +562,29 @@
   }
 
   async function retrySingleHistory(event) {
-    if (!event?.isTrusted || !nativeReceipt || downloadJob) return;
-    const receipt = nativeReceipt;
+    if (!event?.isTrusted || (!nativeReceipt && !singleCleanup && !singleLease) || downloadJob) return;
+    const receipt = nativeReceipt || singleCleanup;
     downloadJob = { type: "history", media: currentMedia };
     updateControls();
     try {
-      if (typeof receipt.rootHandle.requestPermission === "function" &&
+      if (typeof receipt?.rootHandle.requestPermission === "function" &&
           await receipt.rootHandle.requestPermission({ mode: "readwrite" }) !== "granted") throw new Error("Allow access to the library folder, then retry its history update.");
-      await completeSingleHistory();
-      receipt.cache.close();
+      if (nativeReceipt) await completeSingleHistory();
+      if (singleCleanup) { await singleCleanup.cache.abandonWrite(singleCleanup.item); singleCleanup = null; }
+      receipt?.cache.close();
+      await releaseSingleLease();
       finishJob();
       setStatus("The saved video's download history is now recorded.", "success");
     } catch (error) {
       finishJob();
       setStatus(friendlyError(error), "error");
     }
+  }
+
+  async function releaseSingleLease() {
+    if (!singleLease) return;
+    await request({ type: "REEL_SAVER_QUEUE_LEASE_END", kind: "single", ...(singleLease !== "pending" ? { leaseId: singleLease } : {}) });
+    singleLease = null;
   }
 
   function closePanel() {
@@ -538,8 +604,11 @@
     await loadSettings();
     if (!dialog.open) return;
     if (downloadJob?.type === "browser") pollBrowserDownload();
-    else if (!downloadJob && !bulkPanel?.isBusy() && settingsLoaded) await refreshCurrentReel();
+    else if (!downloadJob && !bulkPanel?.isBusy() && !queuePanel?.isBusy() && settingsLoaded) await refreshCurrentReel();
   }
+
+  currentView.addEventListener("click", event => { if (event.isTrusted) { queueView = "profile"; updateControls(); } });
+  profilesView.addEventListener("click", event => { if (event.isTrusted && queuePanel) { queueView = "queue"; updateControls(); queuePanel.load(); } });
 
   launcher.addEventListener("click", () => { if (dialog.open) closePanel(); else openPanel(); });
   close.addEventListener("click", closePanel);
@@ -550,7 +619,7 @@
     if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closePanel();
   });
   destination.addEventListener("change", async event => {
-    if (!event.isTrusted || downloadJob || nativeReceipt || bulkPanel?.isBusy()) { updateControls(); return; }
+    if (!event.isTrusted || downloadJob || nativeReceipt || singleCleanup || singleLease || bulkPanel?.isBusy() || queuePanel?.isBusy()) { updateControls(); return; }
     const requestedDestination = destination.value;
     const previousDestination = selectedDestination;
     if (requestedDestination === "chosen" && directoryHandle) {
@@ -575,7 +644,7 @@
     }
   });
   chooseFolder.addEventListener("click", async event => {
-    if (!event.isTrusted || downloadJob || nativeReceipt || bulkPanel?.isBusy()) return;
+    if (!event.isTrusted || downloadJob || nativeReceipt || singleCleanup || singleLease || bulkPanel?.isBusy() || queuePanel?.isBusy()) return;
     try {
       // Keep this call before any await: the browser requires the button's user activation.
       const pending = globalThis.ReelSaverFolderWriter.chooseFolder();
@@ -591,13 +660,13 @@
     }
   });
   refresh.addEventListener("click", async event => {
-    if (!event.isTrusted || bulkPanel?.isBusy()) return;
+    if (!event.isTrusted || bulkPanel?.isBusy() || queuePanel?.isBusy()) return;
     if (!settingsLoaded) await loadSettings();
     if (settingsLoaded) await refreshCurrentReel();
   });
   download.addEventListener("click", startDownload);
   skipExisting.addEventListener("change", event => {
-    if (!event.isTrusted || downloadJob || nativeReceipt || bulkPanel?.isBusy()) { updateControls(); return; }
+    if (!event.isTrusted || downloadJob || nativeReceipt || singleCleanup || singleLease || bulkPanel?.isBusy() || queuePanel?.isBusy()) { updateControls(); return; }
     skipAlreadyDownloaded = skipExisting.checked;
     updateControls();
   });
@@ -606,6 +675,11 @@
   thumbnail.addEventListener("load", () => { thumbnail.hidden = false; glyph.hidden = true; });
   thumbnail.addEventListener("error", () => { thumbnail.hidden = true; glyph.hidden = false; });
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "REEL_SAVER_QUEUE_EVENT" && sender?.id === chrome.runtime.id && !sender.tab) {
+      queuePanel?.handleEvent(message.run);
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message?.type === "REEL_SAVER_OPEN_PANEL") {
       openPanel();
       sendResponse({ ok: true });
@@ -613,7 +687,7 @@
     return false;
   });
   window.addEventListener("beforeunload", event => {
-    if (downloadJob?.type === "native" || nativeReceipt || bulkPanel?.hasNativeJob()) {
+    if (downloadJob?.type === "native" || nativeReceipt || singleCleanup || bulkPanel?.hasNativeJob() || queuePanel?.hasNativeJob()) {
       event.preventDefault();
       event.returnValue = "";
     }
@@ -626,6 +700,7 @@
     currentRoute = route;
     if (changed && route?.type === "profile" && libraryDestination?.profile.username.toLowerCase() !== route.username.toLowerCase()) libraryDestination = null;
     bulkPanel?.contextChanged();
+    queuePanel?.contextChanged();
     if (route?.type === "profile") {
       context.textContent = `Profile · @${route.username}`;
       const profileHeader = document.querySelector("main header");
@@ -645,7 +720,7 @@
       launcherHost.style.display = "block";
     } else {
       launcherHost.style.display = "none";
-      if (!downloadJob && !bulkPanel?.isBusy()) closePanel();
+      if (!downloadJob && !bulkPanel?.isBusy() && !queuePanel?.isBusy()) closePanel();
     }
     if (!panelHost.isConnected && route) document.documentElement.append(panelHost);
     if (changed && !downloadJob) {

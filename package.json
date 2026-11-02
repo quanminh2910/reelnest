@@ -1,6 +1,6 @@
 {
   "name": "reelnest",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "A standalone, build-free Instagram Reels extension.",
@@ -10,7 +10,8 @@
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:profile": "node scripts/profile-browser-smoke.mjs",
     "test:bulk": "node scripts/bulk-browser-smoke.mjs",
-    "test:extension": "node scripts/bulk-extension-smoke.mjs"
+    "test:extension": "node scripts/bulk-extension-smoke.mjs",
+    "test:queue": "node scripts/profile-queue-browser-smoke.mjs"
   },
   "engines": {
     "node": ">=20"

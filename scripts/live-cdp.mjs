@@ -64,6 +64,14 @@ for await (const line of input) {
       output({ id: request.id, events: events.splice(0) });
       continue;
     }
+    if (request.method === 'helper.extensionTargets') {
+      const extensionId = request.params?.extensionId;
+      if (!/^[a-p]{32}$/.test(extensionId || '')) throw new Error('A specific Chrome extension ID is required.');
+      const { targetInfos } = await send('Target.getTargets');
+      output({ id: request.id, targets: targetInfos.filter(target => target.url.startsWith(`chrome-extension://${extensionId}/`))
+        .map(({ targetId, type, url }) => ({ targetId, type, path: new URL(url).pathname })) });
+      continue;
+    }
     const result = await send(request.method, request.params, request.sessionId);
     output({ id: request.id, result });
   } catch (error) { output({ error: error.message }); }

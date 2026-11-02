@@ -205,7 +205,9 @@
       clearButton.hidden = browserHistory;
       clearButton.disabled = active || isSingleBusy() || readRoute()?.type !== "profile";
       clearConfirm.hidden = clearCancel.hidden = clearSummary.hidden = !clearContext;
-      clearConfirm.disabled = clearCancel.disabled = clearingHistory;
+      clearConfirm.disabled = clearingHistory || !!clearContext?.cacheClosed || !!clearContext?.releaseFailed;
+      clearCancel.disabled = clearingHistory || !!clearContext?.releasePromise;
+      clearCancel.textContent = clearContext?.cacheClosed || clearContext?.releaseFailed ? "Release history operation" : "Cancel";
       hint.textContent = modeValue === "batches"
         ? "Find a batch, save its videos one at a time, then continue. Keep this Instagram tab open."
         : configuredLimit == null ? "Find the full list first, then review the count and start downloading. Keep this tab open."
@@ -575,11 +577,30 @@
       const route = readRoute();
       return route?.type === "profile" && typeof profile?.username === "string" && route.username.toLowerCase() === profile.username.toLowerCase();
     }
-    function closeClearContext() {
+    async function closeClearContext() {
       const context = clearContext;
-      clearContext = null;
-      context?.cache.close();
-      clearSummary.hidden = true;
+      if (!context) return;
+      if (context.releasePromise) return context.releasePromise;
+      const releasing = (async () => {
+        if (!context.cacheClosed) {
+          await context.cache?.close();
+          context.cacheClosed = true;
+        }
+        if (context.leaseRequested) {
+          await request({ type: "REEL_SAVER_QUEUE_LEASE_END", kind: "clear", ...(context.leaseId ? { leaseId: context.leaseId } : {}) });
+        }
+        if (clearContext === context) {
+          clearContext = null;
+          clearSummary.hidden = true;
+        }
+      })();
+      context.releasePromise = releasing;
+      try { await releasing; }
+      catch (cause) {
+        context.releaseFailed = true;
+        clearSummary.textContent = "This history operation still needs to release ReelNest. Click Release history operation to retry. Video files were kept.";
+        throw cause;
+      } finally { if (context.releasePromise === releasing) context.releasePromise = null; }
     }
     async function prepareClear(event) {
       if (!event?.isTrusted || busy() || isSingleBusy()) return;
@@ -588,21 +609,29 @@
       clearingHistory = true;
       onBusyChange(); update();
       setMessage("Checking download history for this profile…");
-      let cache;
+      const context = { cache: null, profile: null, target, attempted: false, leaseRequested: false, cacheClosed: false };
+      clearContext = context;
       try {
+        if (globalThis.ReelNestProfileQueueConfig) {
+          context.leaseRequested = true;
+          const lease = await request({ type: "REEL_SAVER_QUEUE_LEASE_BEGIN", kind: "clear" });
+          if (typeof lease.leaseId !== "string" || !lease.leaseId) throw error("RECONCILIATION_REQUIRED", "The history operation's ownership could not be confirmed. Release it before trying again.");
+          context.leaseId = lease.leaseId;
+        }
         const { profile } = await request({ type: M + "IDENTIFY" });
         if (!atClearProfile(profile)) throw new Error("The profile changed. Open its history again before clearing it.");
-        cache = await globalThis.ReelSaverProfileCache.openLibrary(target.handle, profile);
+        const cache = await globalThis.ReelSaverProfileCache.openLibrary(target.handle, profile);
+        context.cache = cache;
         if (!atClearProfile(profile)) throw new Error("The profile changed. No history was cleared.");
-        clearContext = { cache, profile: cache.profile, target, attempted: false };
+        context.profile = cache.profile;
         showLibrary(cache, target);
         clearSummary.textContent = `Clear download history for @${cache.profile.username} in ${target.name || "Library"} / ${cache.folderName}? ${cache.recordedCount} recorded videos will become eligible to download again. Existing video files will be kept; future downloads receive unique names.`;
         clearConfirm.textContent = "Clear history";
         setMessage("Review the profile and folder above, then confirm or cancel.");
       } catch (cause) {
-        cache?.close();
-        clearContext = null;
-        setMessage(cause.message || "This profile's history could not be opened.", "error");
+        let releaseError;
+        try { await closeClearContext(); } catch (failure) { releaseError = failure; }
+        setMessage(`${cause.message || "This profile's history could not be opened."}${releaseError ? " Click Release history operation to close this session before trying again." : ""}`, "error");
       } finally {
         clearingHistory = false;
         update(); onBusyChange();
@@ -610,12 +639,16 @@
       }
     }
     async function confirmClear(event) {
-      if (!event?.isTrusted || clearingHistory || !clearContext) return;
+      if (!event?.isTrusted || clearingHistory || !clearContext || clearContext.cacheClosed || clearContext.releaseFailed) return;
       const context = clearContext;
       if (!atClearProfile(context.profile) || getDestination().handle !== context.target.handle) {
-        closeClearContext();
-        setMessage(context.attempted ? "The profile or library changed. Video files were kept. Open its history again to check the recorded count." : "The profile or library changed. No history was cleared.");
-        update(); onBusyChange(); return;
+        clearingHistory = true; update(); onBusyChange();
+        try {
+          await closeClearContext();
+          setMessage(context.attempted ? "The profile or library changed. Video files were kept. Open its history again to check the recorded count." : "The profile or library changed. No history was cleared.");
+        } catch (cause) { setMessage(`${cause.message || "The history operation could not be released."} Click Release history operation to retry.`, "error"); }
+        finally { clearingHistory = false; update(); onBusyChange(); }
+        return;
       }
       clearingHistory = true;
       update(); onBusyChange();
@@ -631,24 +664,30 @@
         const result = await context.cache.clearHistory();
         retryRetired = true;
         if (atClearProfile(context.profile)) showLibrary(context.cache, context.target);
-        closeClearContext();
+        await closeClearContext();
         setMessage(`Cleared ${result.cleared} download records for @${context.profile.username}. Video files were kept. The next job can download these Reels again.`, "success");
         onActivity?.(`history-clear-${Date.now()}`, `History cleared · @${context.profile.username} · ${result.cleared} records; videos kept`, "complete");
       } catch (cause) {
         clearConfirm.textContent = "Retry clearing history";
-        setMessage(`${cause.message || "Download history could not be fully cleared."} Video files were kept.`, "error");
+        setMessage(`${cause.message || "Download history could not be fully cleared."} Video files were kept.${context.releaseFailed ? " Click Release history operation to close this session." : ""}`, "error");
       } finally {
         clearingHistory = false;
-        if (clearContext && !atClearProfile(clearContext.profile)) closeClearContext();
+        if (clearContext && !clearContext.releaseFailed && !atClearProfile(clearContext.profile)) {
+          try { await closeClearContext(); }
+          catch (cause) { setMessage(`${cause.message || "The history operation could not be released."} Click Release history operation to retry.`, "error"); }
+        }
         update(); onBusyChange();
       }
     }
-    function cancelClear(event) {
+    async function cancelClear(event) {
       if (!event?.isTrusted || clearingHistory || !clearContext) return;
       const attempted = clearContext.attempted;
-      closeClearContext();
-      setMessage(attempted ? "History operation closed. Video files were kept. Open the profile history again to check its recorded count." : "History clear canceled. No download records were cleared.");
-      update(); onBusyChange();
+      clearingHistory = true; update(); onBusyChange();
+      try {
+        await closeClearContext();
+        setMessage(attempted ? "History operation closed. Video files were kept. Open the profile history again to check its recorded count." : "History clear canceled. No download records were cleared.");
+      } catch (cause) { setMessage(`${cause.message || "The history operation could not be released."} Click Release history operation to retry.`, "error"); }
+      finally { clearingHistory = false; update(); onBusyChange(); }
     }
     async function closeImport() {
       if (!importContext) return;
@@ -917,10 +956,14 @@
           onBusyChange();
         }
       }
-      if (clearContext && !clearingHistory && !atClearProfile(clearContext.profile)) {
+      if (clearContext && !clearingHistory && !clearContext.releaseFailed && !atClearProfile(clearContext.profile)) {
         const attempted = clearContext.attempted;
-        closeClearContext();
-        setMessage(attempted ? "History operation closed because the profile changed. Videos were kept. Open its history again to check the recorded count." : "History clear canceled because the profile changed. No download records were cleared.");
+        clearingHistory = true;
+        closeClearContext().then(() => {
+          setMessage(attempted ? "History operation closed because the profile changed. Videos were kept. Open its history again to check the recorded count." : "History clear canceled because the profile changed. No download records were cleared.");
+        }).catch(cause => {
+          setMessage(`${cause.message || "The history operation could not be released."} Click Release history operation to retry.`, "error");
+        }).finally(() => { clearingHistory = false; update(); onBusyChange(); });
         onBusyChange();
       }
       update();
