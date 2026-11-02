@@ -201,7 +201,7 @@ async function recordBrowser(ctx, jobId, mediaId, attemptId, download, patch = {
     // Chrome has already returned this ID. Keep that acceptance proof in the
     // session journal before a durable-receipt write can fail; filename/time
     // reconciliation could otherwise confuse a rapid deliberate older copy.
-    await writeOperation(ctx, jobId, mediaId, attemptId, { ...patch, state: "in_progress", downloadId: download.id,
+    await writeOperation(ctx, jobId, mediaId, attemptId, { ...patch, attemptId, state: "in_progress", downloadId: download.id,
       ...(download.filename ? { filename: download.filename } : {}) }, "unknown");
     const raw = await rawOwnDownload(download.id);
     if (!item || !raw) throw problem("CACHE_RECEIPT_UNCONFIRMED", "The saved video's Chrome record could not be confirmed. Retry its status before downloading again.", "history");

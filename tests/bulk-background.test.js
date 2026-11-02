@@ -37,7 +37,7 @@ function fixture() {
         state.failSessionWrite = false;
         throw new Error("Storage unavailable");
       }
-      if (state.failLocalWrite && name === "local") {
+      if (state.failLocalWrite && name === "local" && Object.keys(values).some(key => key.startsWith("reelnest:browser-receipt:v1:"))) {
         state.failLocalWrite = false;
         throw new Error("Local storage unavailable");
       }
@@ -1151,6 +1151,38 @@ test("receipt persistence failures hold allowance and replay metadata without an
   assert.equal(f.state.session[activeKey].reservationMediaId, null);
   assert.ok(f.state.local[receiptKey(profile.id, item)]);
   assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+});
+
+test("low receipt storage blocks new physical saves while accepted downloads can still reconcile metadata", async () => {
+  const f = fixture(); let api = await load(f); const job = await start(api, sender(), "downloads", 1);
+  await discover(api, job);
+  let usedBytes = 9000, capacityChecks = 0;
+  f.chrome.storage.local.QUOTA_BYTES = 10000;
+  f.chrome.storage.local.getBytesInUse = async key => { assert.equal(key, null); capacityChecks++; return usedBytes; };
+  const blocked = await api.handleBulkMessage(operation("DOWNLOAD", job), sender());
+  assert.equal(blocked.error.code, "CACHE_RECEIPT_LIMIT");
+  assert.equal(f.state.sourceCalls.filter(request => request.action === "resolve").length, 0);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 0);
+  assert.equal(f.state.session[operationKey(job.jobId)], undefined);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 0);
+  assert.equal(capacityChecks, 1);
+
+  usedBytes = 0;
+  assert.equal((await api.handleBulkMessage(operation("DOWNLOAD", job), sender())).ok, true);
+  assert.equal(capacityChecks, 2);
+  usedBytes = 9000;
+  f.state.downloads[0].state = "complete";
+  api = await load(f);
+  const reconciled = await api.handleBulkMessage(operation("DOWNLOAD", job, "recovered"), sender());
+  assert.equal(reconciled.ok, true, JSON.stringify(reconciled));
+  assert.equal(reconciled.download.id, 1);
+  assert.equal(capacityChecks, 2, "accepted saves replay metadata without reserving another file's headroom");
+  assert.equal(f.state.sourceCalls.filter(request => request.action === "resolve").length, 1);
+  assert.equal(f.state.calls.filter(call => call.type === "download").length, 1);
+  assert.equal(f.state.session[activeKey].reservationMediaId, null);
+  assert.equal(f.state.session[activeKey].committedNewSaves, 1);
+  assert.equal(f.state.local[receiptKey(profile.id, item)].downloadId, 1);
 });
 
 test("an immediately completed download journals its accepted ID before a receipt failure despite a rapid older copy", async () => {

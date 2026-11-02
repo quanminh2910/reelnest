@@ -10,6 +10,7 @@ export const MAX_CLAIMS = 20_000;
 const MAX_REPORT_ITEMS = 50_000;
 const MAX_REPORT_BYTES = 16 * 1024 * 1024;
 const MAX_CANDIDATES = 200;
+const SAVE_HEADROOM_BYTES = 2048;
 let mutationTail = Promise.resolve();
 
 const problem = (code, message) => Object.assign(new Error(message), { code, stage: "history" });
@@ -64,7 +65,7 @@ async function read(key) {
 
 async function write(values) {
   try { await chrome.storage.local.set(values); }
-  catch { throw problem("CACHE_RECEIPT_WRITE_FAILED", "The video is saved, but its browser receipt could not be recorded. Retry its history update without downloading another copy."); }
+  catch { throw problem("CACHE_RECEIPT_WRITE_FAILED", "Browser download history could not be recorded. Retry its history update before downloading another copy."); }
 }
 
 async function locked(action) {
@@ -137,20 +138,24 @@ async function allClaims() {
 
 // Migrate old receipt rows only once. A claim remains after another copy
 // replaces the latest receipt: the older Chrome file may still be present.
-async function ensureClaims() {
+async function ensureClaims({ repair = false } = {}) {
   const index = validateIndex(await read(INDEX));
-  if (index?.claimsVersion === 1) return index;
+  if (index?.claimsVersion === 1 && !repair) return index;
   const receipts = await allReceipts();
   const claims = await allClaims();
+  const additions = {};
   for (const receipt of receipts) {
     const previous = claims.get(receipt.downloadId);
     if (previous && previous.mediaId !== receipt.mediaId) throw problem("CACHE_RECEIPT_CORRUPT", "A browser download is recorded for conflicting Reel identities.");
-    if (!previous) claims.set(receipt.downloadId, { schemaVersion: 1, downloadId: receipt.downloadId,
-      mediaId: receipt.mediaId, recordedAt: receipt.savedAt });
+    if (!previous) {
+      const claim = { schemaVersion: 1, downloadId: receipt.downloadId, mediaId: receipt.mediaId, recordedAt: receipt.savedAt };
+      claims.set(receipt.downloadId, claim);
+      additions[`${CLAIM_PREFIX}${receipt.downloadId}`] = claim;
+    }
   }
   if (claims.size > MAX_CLAIMS) throw problem("CACHE_RECEIPT_LIMIT", "The browser download identity limit has been reached. Use a Library folder for further downloads.");
   const next = { schemaVersion: 1, count: receipts.length, claimsVersion: 1, claimsCount: claims.size };
-  await write({ ...Object.fromEntries([...claims].map(([id, value]) => [`${CLAIM_PREFIX}${id}`, value])), [INDEX]: next });
+  await write({ ...additions, [INDEX]: next });
   return next;
 }
 
@@ -165,10 +170,16 @@ export async function isDownloadClaimedByOtherMedia(downloadId, mediaId) {
   });
 }
 
-async function indexCount({ repair = false } = {}) {
-  const index = validateIndex(await read(INDEX));
-  if (index === undefined || repair) return (await allReceipts()).length;
-  return index.count;
+async function assertStorageHeadroom() {
+  const area = chrome.storage.local;
+  if (typeof area.getBytesInUse !== "function" || !positive(area.QUOTA_BYTES)) return;
+  let used;
+  try { used = await area.getBytesInUse(null); }
+  catch { throw problem("CACHE_RECEIPT_READ_FAILED", "Available browser history storage could not be checked. Retry before downloading more videos."); }
+  if (!Number.isSafeInteger(used) || used < 0) throw problem("CACHE_RECEIPT_READ_FAILED", "Chrome returned an unknown browser history storage size. Retry before downloading more videos.");
+  if (used + SAVE_HEADROOM_BYTES > area.QUOTA_BYTES) {
+    throw problem("CACHE_RECEIPT_LIMIT", "Browser history storage is nearly full. Choose a Library folder before starting another download.");
+  }
 }
 
 export async function getReceipt(profileId, item) {
@@ -181,11 +192,11 @@ export async function assertReceiptCapacity(profileId, item) {
   identity(profileId, item);
   return locked(async () => {
     const old = await getReceipt(profileId, item);
-    let count = await indexCount();
-    if (!old && count >= MAX_RECEIPTS) count = await indexCount({ repair: true });
-    if (!old && count >= MAX_RECEIPTS) throw problem("CACHE_RECEIPT_LIMIT", "The browser receipt limit of 20,000 has been reached. Choose a Library folder before starting another download.");
-    const index = await ensureClaims();
+    let index = await ensureClaims();
+    if (!old && index.count >= MAX_RECEIPTS || index.claimsCount >= MAX_CLAIMS) index = await ensureClaims({ repair: true });
+    if (!old && index.count >= MAX_RECEIPTS) throw problem("CACHE_RECEIPT_LIMIT", "The browser receipt limit of 20,000 has been reached. Choose a Library folder before starting another download.");
     if (index.claimsCount >= MAX_CLAIMS) throw problem("CACHE_RECEIPT_LIMIT", "The browser download identity limit of 20,000 has been reached. Choose a Library folder before starting another download.");
+    await assertStorageHeadroom();
   });
 }
 
@@ -212,13 +223,15 @@ export async function recordReceipt(profileId, item, download, { check } = {}) {
   return locked(async () => {
     await check?.();
     const old = await getReceipt(profileId, item);
-    let count = await indexCount();
-    if (!old && count >= MAX_RECEIPTS) count = await indexCount({ repair: true });
-    if (!old && count >= MAX_RECEIPTS) throw problem("CACHE_RECEIPT_LIMIT", "The browser receipt limit of 20,000 has been reached. Use a Library folder for further downloads.");
-    const index = await ensureClaims();
-    count = await indexCount();
-    const claim = await readClaim(download.id);
+    let index = await ensureClaims();
+    let claim = await readClaim(download.id);
     if (claim && claim.mediaId !== expected.mediaId) throw problem("CACHE_RECEIPT_IDENTITY_CONFLICT", "This Chrome download is already recorded for another Reel. Its history was kept unchanged.");
+    if (!old && index.count >= MAX_RECEIPTS || !claim && index.claimsCount >= MAX_CLAIMS) {
+      index = await ensureClaims({ repair: true });
+      claim = await readClaim(download.id);
+      if (claim && claim.mediaId !== expected.mediaId) throw problem("CACHE_RECEIPT_IDENTITY_CONFLICT", "This Chrome download is already recorded for another Reel. Its history was kept unchanged.");
+    }
+    if (!old && index.count >= MAX_RECEIPTS) throw problem("CACHE_RECEIPT_LIMIT", "The browser receipt limit of 20,000 has been reached. Use a Library folder for further downloads.");
     if (!claim && index.claimsCount >= MAX_CLAIMS) throw problem("CACHE_RECEIPT_LIMIT", "The browser download identity limit of 20,000 has been reached. Use a Library folder for further downloads.");
     const value = { schemaVersion: 1, ...expected, downloadId: download.id, filename: basename(download.filename),
       bytesWritten: download.fileSize, savedAt: old?.downloadId === download.id ? old.savedAt : Date.now() };
@@ -227,7 +240,7 @@ export async function recordReceipt(profileId, item, download, { check } = {}) {
     await write({ [receiptKey(profileId, item)]: value,
       ...(!claim ? { [`${CLAIM_PREFIX}${download.id}`]: { schemaVersion: 1, downloadId: download.id,
         mediaId: expected.mediaId, recordedAt: value.savedAt } } : {}),
-      [INDEX]: { schemaVersion: 1, count: count + (old ? 0 : 1), claimsVersion: 1, claimsCount: index.claimsCount + (claim ? 0 : 1) } });
+      [INDEX]: { schemaVersion: 1, count: index.count + (old ? 0 : 1), claimsVersion: 1, claimsCount: index.claimsCount + (claim ? 0 : 1) } });
     return value;
   });
 }
@@ -245,12 +258,11 @@ export async function removeReceipt(profileId, mediaId, expected, { forgetDownlo
     // A slow existence check must not delete a newer completed save's receipt.
     if (expected && (receipt.downloadId !== expected.downloadId || receipt.filename !== expected.filename || receipt.bytesWritten !== expected.bytesWritten)) return false;
     const index = await ensureClaims();
-    const count = await indexCount();
     const claim = forgetDownload ? await readClaim(receipt.downloadId) : null;
     const forgetClaim = claim?.mediaId === mediaId;
     try { await chrome.storage.local.remove(forgetClaim ? [key, `${CLAIM_PREFIX}${receipt.downloadId}`] : key); }
     catch { throw problem("CACHE_RECEIPT_WRITE_FAILED", "A stale browser receipt could not be removed. Retry its history update before downloading."); }
-    await write({ [INDEX]: { schemaVersion: 1, count: Math.max(0, count - 1), claimsVersion: 1,
+    await write({ [INDEX]: { schemaVersion: 1, count: Math.max(0, index.count - 1), claimsVersion: 1,
       claimsCount: Math.max(0, index.claimsCount - (forgetClaim ? 1 : 0)) } });
     return true;
   });
@@ -267,6 +279,12 @@ export async function verifyReceipt(profileId, item, retryReplacement = true) {
   }
   const matches = await search({ id: receipt.downloadId });
   const download = matches.find(value => value.id === receipt.downloadId);
+  if (download && download.exists !== false &&
+      (download.exists !== true || !["complete", "interrupted"].includes(download.state) ||
+       typeof download.byExtensionId !== "string" || typeof download.filename !== "string" || !download.filename ||
+       typeof download.mime !== "string" || !download.mime || typeof download.url !== "string" || !download.url)) {
+    throw problem("CACHE_RECEIPT_UNVERIFIED", "Chrome has not confirmed the saved video's file metadata. Check Downloads, then retry its history check.");
+  }
   if (validDownload(download) && !positive(download.fileSize)) {
     throw problem("CACHE_RECEIPT_UNVERIFIED", "Chrome has not confirmed the saved video's size. Check Downloads, then retry its history check.");
   }
@@ -344,8 +362,7 @@ export async function previewReport(profileId, report, { check } = {}) {
   const recorded = new Set(current.filter(value => value.profileId === profileId).map(value => value.mediaId));
   const newRecords = items.filter(value => !recorded.has(value.mediaId)).length;
   if (current.length + newRecords > MAX_RECEIPTS) throw problem("CACHE_RECEIPT_LIMIT", "This report exceeds the remaining browser receipt capacity. Import a smaller report or use a Library folder.");
-  const newClaims = new Set(items.filter(value => !claims.has(value.downloadId)).map(value => value.downloadId));
-  if (claims.size + newClaims.size > MAX_CLAIMS) throw problem("CACHE_RECEIPT_LIMIT", "This report exceeds the remaining browser download identity capacity. Import a smaller report or use a Library folder.");
+  if (claims.size > MAX_CLAIMS) throw problem("CACHE_RECEIPT_LIMIT", "This report exceeds the remaining browser download identity capacity. Import a smaller report or use a Library folder.");
   return { profileId, items, counts: { total: normalized.total, eligible: items.length, missing, ignored: normalized.ignored } };
 }
 

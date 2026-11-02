@@ -28,7 +28,7 @@ function fixture() {
     async remove(key) {
       state.removes++;
       if (state.failRemove) throw new Error("Storage remove unavailable");
-      delete state.local[key];
+      for (const entry of Array.isArray(key) ? key : [key]) delete state.local[entry];
     },
   } }, downloads: {
     async search(query) {
@@ -134,6 +134,20 @@ test("unknown browser metadata and history errors preserve receipts and pause in
   for (const change of [{ fileSize: -1 }, { fileSize: 0 }, { exists: false }, { state: "in_progress" }, { mime: "text/html" }, { byExtensionId: "other" }]) {
     await assert.rejects(api.recordReceipt(profileId, other, complete(change)), { code: "CACHE_RECEIPT_UNVERIFIED" });
   }
+});
+
+test("incomplete Chrome file metadata preserves a verified receipt until it can be checked", async () => {
+  const f = fixture(); const api = await load(f);
+  await api.recordReceipt(profileId, item, complete());
+  for (const change of [{ exists: undefined }, { state: "in_progress" }, { state: undefined },
+    { byExtensionId: undefined }, { filename: undefined }, { mime: undefined }, { mime: "" }, { url: undefined }]) {
+    f.state.downloads = [complete(change)];
+    const before = structuredClone(f.state.local);
+    await assert.rejects(api.verifyReceipt(profileId, item), { code: "CACHE_RECEIPT_UNVERIFIED" }, JSON.stringify(change));
+    assert.deepEqual(f.state.local, before);
+  }
+  f.state.downloads = [complete()];
+  assert.equal((await api.verifyReceipt(profileId, item)).downloadId, 7);
 });
 
 test("corrupt and newer receipts or indexes fail closed and remain unchanged", async () => {
@@ -248,7 +262,7 @@ test("report guards stop a preview and a queued import before another query or w
   assert.deepEqual(f.state.local, {});
 });
 
-test("receipt limits never evict earlier records and allow updating an existing receipt", async () => {
+test("receipt and download-claim limits prevent new copies while allowing metadata-only replay", async () => {
   const f = fixture(); const api = await load(f);
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
   const code = input => { let value = BigInt(input), output = ""; do { output = alphabet[Number(value % 64n)] + output; value /= 64n; } while (value); return output; };
@@ -260,12 +274,75 @@ test("receipt limits never evict earlier records and allow updating an existing 
   f.state.local["reelnest:browser-receipt-index"] = { schemaVersion: 1, count: api.MAX_RECEIPTS };
   const next = { mediaId: "999999", shortcode: code(999999) };
   await assert.rejects(api.assertReceiptCapacity(profileId, next), { code: "CACHE_RECEIPT_LIMIT" });
-  await api.assertReceiptCapacity(profileId, item);
-  await assert.rejects(api.recordReceipt(profileId, next, complete()), { code: "CACHE_RECEIPT_LIMIT" });
-  assert.equal(Object.keys(f.state.local).length, api.MAX_RECEIPTS + 1);
-  assert.equal(f.state.writes, 0);
-  await api.recordReceipt(profileId, item, complete());
+  await assert.rejects(api.assertReceiptCapacity(profileId, item), { code: "CACHE_RECEIPT_LIMIT" });
+  await assert.rejects(api.recordReceipt(profileId, next, complete({ id: 999999 })), { code: "CACHE_RECEIPT_LIMIT" });
+  assert.equal(Object.keys(f.state.local).length, api.MAX_RECEIPTS + api.MAX_CLAIMS + 1);
+  const before = structuredClone(f.state.local);
+  await api.recordReceipt(profileId, item, complete({ id: 127, filename: "C:/Fixture Downloads/creator_B_.mp4" }));
+  assert.deepEqual(f.state.local, before, "replaying an existing completed download retains every earlier identity");
   assert.equal(Object.values(f.state.local).find(value => value?.count !== undefined).count, api.MAX_RECEIPTS);
+});
+
+test("historical claims survive receipt replacement and cannot be reassigned to another Reel", async () => {
+  const f = fixture(); let api = await load(f);
+  const old = complete({ filename: "C:/Fixture Downloads/coauthor_B.mp4" });
+  f.state.downloads = [old];
+  await api.importReport(profileId, report());
+  const replacement = complete({ id: 8, filename: "C:/Fixture Downloads/coauthor_B_.mp4" });
+  await api.recordReceipt(profileId, item, replacement);
+  api = await load(f);
+  const distinct = { mediaId: "1", shortcode: "B" };
+  assert.equal(await api.isDownloadClaimedByOtherMedia(7, distinct.mediaId), true);
+  const before = structuredClone(f.state.local);
+  await assert.rejects(api.recordReceipt(profileId, distinct, old), { code: "CACHE_RECEIPT_IDENTITY_CONFLICT" });
+  await assert.rejects(api.previewReport(profileId, report([{ ...distinct, state: "saved", filename: "coauthor_B.mp4", bytesWritten: 2048 }])), { code: "CACHE_RECEIPT_REPORT_INVALID" });
+  assert.deepEqual(f.state.local, before);
+  await api.recordReceipt("67890", item, replacement);
+  assert.equal(await api.isDownloadClaimedByOtherMedia(8, item.mediaId), false, "the same coauthored Reel may appear on multiple profiles");
+});
+
+test("historical copies have their own capacity bound and report preview never mutates it", async () => {
+  const f = fixture(); const api = await load(f);
+  await api.recordReceipt(profileId, item, complete());
+  for (let id = 1; id <= api.MAX_CLAIMS; id++) {
+    f.state.local[`${api.CLAIM_PREFIX}${id}`] = { schemaVersion: 1, downloadId: id, mediaId: item.mediaId, recordedAt: 1 };
+  }
+  f.state.local["reelnest:browser-receipt-index"].claimsCount = api.MAX_CLAIMS;
+  await assert.rejects(api.assertReceiptCapacity(profileId, item), { code: "CACHE_RECEIPT_LIMIT" });
+  await assert.rejects(api.recordReceipt(profileId, item, complete({ id: api.MAX_CLAIMS + 1 })), { code: "CACHE_RECEIPT_LIMIT" });
+  await api.recordReceipt(profileId, item, complete());
+  f.state.downloads = [complete({ id: api.MAX_CLAIMS + 1, filename: "C:/Fixture Downloads/coauthor_CA.mp4" })];
+  const before = structuredClone(f.state.local);
+  await assert.rejects(api.previewReport(profileId, report([{ ...other, state: "saved", filename: "coauthor_CA.mp4", bytesWritten: 2048 }])), { code: "CACHE_RECEIPT_LIMIT" });
+  assert.deepEqual(f.state.local, before);
+  assert.equal(f.state.local["reelnest:browser-receipt-index"].count, 1);
+});
+
+test("claim-index repair recovers a failed removal journal update without losing other claims", async () => {
+  const f = fixture(); const api = await load(f);
+  await api.recordReceipt(profileId, item, complete());
+  f.state.failWrite = true;
+  await assert.rejects(api.removeReceipt(profileId, item.mediaId, undefined, { forgetDownload: true }), { code: "CACHE_RECEIPT_WRITE_FAILED" });
+  assert.equal(await api.getReceipt(profileId, item), null);
+  // Model the same partial removal when an index was at its hard boundary.
+  f.state.local["reelnest:browser-receipt-index"] = { schemaVersion: 1, count: api.MAX_RECEIPTS, claimsVersion: 1, claimsCount: api.MAX_CLAIMS };
+  await api.assertReceiptCapacity(profileId, other);
+  assert.deepEqual(f.state.local["reelnest:browser-receipt-index"], { schemaVersion: 1, count: 0, claimsVersion: 1, claimsCount: 0 });
+  await api.recordReceipt(profileId, other, complete({ id: 8, filename: "C:/Fixture Downloads/coauthor_CA.mp4" }));
+  assert.equal(f.state.local["reelnest:browser-receipt-index"].claimsCount, 1);
+});
+
+test("known storage quota pressure blocks new physical saves but permits receipt replay", async () => {
+  const f = fixture(); const api = await load(f);
+  await api.recordReceipt(profileId, item, complete());
+  f.chrome.storage.local.QUOTA_BYTES = 10_000;
+  f.chrome.storage.local.getBytesInUse = async () => 9_000;
+  await assert.rejects(api.assertReceiptCapacity(profileId, other), { code: "CACHE_RECEIPT_LIMIT" });
+  await api.recordReceipt(profileId, item, complete());
+  f.chrome.storage.local.getBytesInUse = async () => 7_000;
+  await api.assertReceiptCapacity(profileId, other);
+  f.chrome.storage.local.getBytesInUse = async () => { throw new Error("Quota check unavailable"); };
+  await assert.rejects(api.assertReceiptCapacity(profileId, other), { code: "CACHE_RECEIPT_READ_FAILED" });
 });
 
 test("oversized reports and browser-storage failures fail closed", async () => {
