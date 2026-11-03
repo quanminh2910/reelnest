@@ -11,6 +11,8 @@ const DRAFT = "reelnest:queue-draft:v1";
 const actions = new Set(["DRAFT_GET", "DRAFT_SET", "LATEST", "START", "ENTRY_START", "PROGRESS", "ENTRY_FINISH",
   "PAUSE", "RESUME", "SKIP", "STOP", "SHOW_SOURCE", "REPORT", "RETRY", "LEASE_BEGIN", "LEASE_END", "RECOVERY_INFO", "RECONCILE"].map(action => `REEL_SAVER_QUEUE_${action}`));
 const terminals = new Set(["completed", "completed_with_errors", "stopped", "interrupted"]);
+const MAX_SOURCE_WAIT_MS = 86_400_000;
+const boundedWait = value => Number.isFinite(value) && value > 0 ? Math.min(Math.ceil(value), MAX_SOURCE_WAIT_MS) : null;
 const preparing = new Map();
 let ownerTail = Promise.resolve();
 export const isProfileQueueMessage = value => actions.has(value?.type);
@@ -117,7 +119,12 @@ async function prepareSource(ctx, captured, entry) {
   const frames = await chrome.scripting.executeScript({ target: { tabId: tab.id, documentIds: [documentId] }, world: "MAIN", func: profileSource, args: [{ action: "identify" }] });
   const result = frames.find(value => value.frameId === 0)?.result;
   await sameGeneration(ctx, captured);
-  if (!result?.ok) throw problem(result?.error?.code || "PROFILE_UNAVAILABLE", result?.error?.message || "Instagram could not identify this profile.");
+  if (!result?.ok) {
+    const error = problem(result?.error?.code || "PROFILE_UNAVAILABLE", result?.error?.message || "Instagram could not identify this profile.");
+    const wait = boundedWait(result?.error?.retryAfterMs);
+    if (wait !== null) Object.assign(error, { retryAfterMs: wait, retryAt: Date.now() + wait });
+    throw error;
+  }
   const profile = result.profile;
   if (!profile || !/^[1-9][0-9]{0,29}$/.test(profile.id) || profile.username?.toLowerCase() !== entry.username.toLowerCase()) {
     throw problem("PROFILE_CHANGED", "Instagram returned a different profile. Review this entry before continuing.");
@@ -182,6 +189,17 @@ async function start(ctx, message) {
   });
 }
 
+async function pauseSourcePreparation(run, entry, captured, error) {
+  const latest = await readQueueOwner();
+  if (latest?.runId !== run.id || latest.epoch !== captured.epoch || !latest.active || latest.control !== "running") return;
+  const wait = boundedWait(error.retryAfterMs);
+  const details = { code: error.code || "SOURCE_UNAVAILABLE", message: error.message,
+    ...(wait !== null ? { retryAfterMs: wait, retryAt: error.retryAt } : {}) };
+  await saveOwner({ ...latest, control: "paused", navigating: false });
+  await queueStore.updateEntry(run.id, entry.id, { state: "needs_attention", error: details });
+  await queueStore.updateRun(run.id, { state: "paused", error: details });
+}
+
 async function entryStart(ctx, message) {
   const observed = await current(ctx, message.runId);
   if (observed.control !== "running") throw problem("QUEUE_PAUSED", "Resume the queue before starting another profile.");
@@ -222,19 +240,14 @@ async function entryStart(ctx, message) {
       const jobId = crypto.randomUUID();
       const owner = await sameGeneration(ctx, captured);
       await saveOwner({ ...owner, ...source, profile: undefined, childJobId: jobId, sourceLost: false });
-      run = await queueStore.updateEntry(run.id, entry.id, { profile: source.profile, childJobId: jobId, state: "running", startedAt: entry.startedAt || Date.now() });
+      run = await queueStore.updateEntry(run.id, entry.id, { profile: source.profile, childJobId: jobId, state: "running", error: null, startedAt: entry.startedAt || Date.now() });
       const retryItems = owner.retryPass ? await failedItems(run.id, entry.id) : undefined;
       const job = await startQueueChild(ctx, { jobId, profile: source.profile,
         options: { mode: "batches", batchSize: run.draft.batchSize, destination: run.options.destination, skipExisting: run.options.skipExisting, maxNewVideos: Number.isFinite(budget) ? budget : null },
         queue: { runId: run.id, entryId: entry.id, generation: owner.generation, sourceTabId: source.sourceTabId, sourceDocumentId: source.sourceDocumentId }, retryItems });
       return { ok: true, run, job };
     } catch (error) {
-      const latest = await readQueueOwner();
-      if (latest?.runId === run.id && latest.epoch === captured.epoch && latest.active && latest.control === "running") {
-        await saveOwner({ ...latest, control: "paused", navigating: false });
-        await queueStore.updateEntry(run.id, entry.id, { state: "needs_attention", error: { code: error.code || "SOURCE_UNAVAILABLE", message: error.message } });
-        await queueStore.updateRun(run.id, { state: "paused", error: { code: error.code || "SOURCE_UNAVAILABLE", message: error.message } });
-      }
+      await pauseSourcePreparation(run, entry, captured, error);
       throw error;
     }
   })();
@@ -282,6 +295,13 @@ async function finishEntry(ctx, message, reason) {
 async function control(ctx, message, action, sender) {
   const initial = await current(ctx, message.runId, { inactive: true });
   const before = await queueStore.getRun(message.runId);
+  if (action === "RESUME") {
+    const now = Date.now();
+    const retryAt = Math.max(...[before.error?.retryAt, before.entries[before.currentIndex]?.error?.retryAt]
+      .map(value => Number.isSafeInteger(value) && value > 0 ? value : 0));
+    if (retryAt > now) throw Object.assign(problem("RATE_LIMITED", "Instagram asked you to wait. Resume after the wait has ended."),
+      { retryAt, retryAfterMs: Math.min(retryAt - now, MAX_SOURCE_WAIT_MS) });
+  }
   if (action === "STOP" && !initial.active && terminals.has(before.state)) return { ok: true, run: before };
   if (action === "SKIP" && message.entryId && before.entries[before.currentIndex]?.id !== message.entryId) return { ok: true, run: before };
   if (action === "SKIP" && before.entries[before.currentIndex]?.state === "skipped") {
@@ -299,10 +319,16 @@ async function control(ctx, message, action, sender) {
   if (action === "RESUME") {
     if (owner.sourceLost && owner.childJobId) {
       const entry = run.entries[run.currentIndex];
-      const source = await prepareSource(ctx, owner, entry);
-      owner = await current(ctx, run.id);
-      await saveOwner({ ...owner, ...source, profile: undefined, sourceLost: false });
-      await rebindQueueChild(ctx, owner.childJobId, { runId: run.id, entryId: entry.id, generation: owner.generation, ...source, profile: undefined });
+      try {
+        const source = await prepareSource(ctx, owner, entry);
+        owner = await current(ctx, run.id);
+        await saveOwner({ ...owner, ...source, profile: undefined, sourceLost: false });
+        await rebindQueueChild(ctx, owner.childJobId, { runId: run.id, entryId: entry.id, generation: owner.generation, ...source, profile: undefined });
+        await queueStore.updateEntry(run.id, entry.id, { state: "running", error: null });
+      } catch (error) {
+        await pauseSourcePreparation(run, entry, owner, error);
+        throw error;
+      }
     }
     return { ok: true, run: await queueStore.updateRun(run.id, { state: "running", error: null }) };
   }
@@ -317,13 +343,13 @@ async function control(ctx, message, action, sender) {
   if (run.reservation) throw problem("RECONCILIATION_REQUIRED", "A saved file or interrupted transfer still needs its history recorded.");
   if (action === "STOP") {
     const entry = run.entries[run.currentIndex];
-    if (entry && ["running", "needs_attention", "paused"].includes(entry.state)) await queueStore.finishEntry(run.id, entry.id, { state: "stopped", completionReason: "user_stopped", sourceExhausted: message.summary?.sourceExhausted === true });
+    if (entry && ["running", "needs_attention", "paused"].includes(entry.state)) await queueStore.finishEntry(run.id, entry.id, { state: "stopped", completionReason: "user_stopped", sourceExhausted: owner.retryPass ? entry.sourceExhausted : message.summary?.sourceExhausted === true });
     return { ok: true, run: await finishRun(ctx, await queueStore.getRun(run.id), "user_stopped", "stopped") };
   }
   if (action === "SKIP") {
     const entry = run.entries[run.currentIndex];
     if (message.entryId && message.entryId !== entry?.id) return { ok: true, run };
-    await queueStore.finishEntry(run.id, entry.id, { state: "skipped", completionReason: "user_skipped", sourceExhausted: message.summary?.sourceExhausted === true });
+    await queueStore.finishEntry(run.id, entry.id, { state: "skipped", completionReason: "user_skipped", sourceExhausted: owner.retryPass ? entry.sourceExhausted : message.summary?.sourceExhausted === true });
     owner = await current(ctx, run.id);
     await saveOwner({ ...owner, childJobId: null, control: "running" });
     await queueStore.updateRun(run.id, { state: "running" });
@@ -423,6 +449,8 @@ export async function handleProfileQueueMessage(message, sender) {
       return { ok: true, run };
     });
   } catch (error) {
-    return { ok: false, error: { code: error.code || "QUEUE_ERROR", message: error.message || "The profile queue could not continue.", stage: error.stage || "queue" } };
+    return { ok: false, error: { code: error.code || "QUEUE_ERROR", message: error.message || "The profile queue could not continue.", stage: error.stage || "queue",
+      ...(boundedWait(error.retryAfterMs) !== null ? { retryAfterMs: boundedWait(error.retryAfterMs) } : {}),
+      ...(Number.isSafeInteger(error.retryAt) && error.retryAt > 0 ? { retryAt: error.retryAt } : {}) } };
   }
 }

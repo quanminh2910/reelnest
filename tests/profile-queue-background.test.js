@@ -86,7 +86,7 @@ function fixture(options = {}) {
       else if (action === 'extract') result = { ok: true, media: { shortcode: value.args[0], username: 'host_creator',
         pageUrl: `https://www.instagram.com/reel/${value.args[0]}/`, url: 'https://scontent.cdninstagram.com/single.mp4' } };
       else if (!fixtureProfile) result = { ok: false, error: { code: 'PROFILE_UNAVAILABLE', message: 'Profile unavailable' } };
-      else if (action === 'identify') result = { ok: true, profile: fixtureProfile.profile };
+      else if (action === 'identify') result = state.identifyError ? { ok: false, error: state.identifyError } : { ok: true, profile: fixtureProfile.profile };
       else if (action === 'page') {
         const offset = Number(value.args[0].cursor || 0), entries = fixtureProfile.ids.slice(offset, offset + 12).map(media), next = offset + entries.length;
         result = { ok: true, profile: fixtureProfile.profile, page: { items: entries, nextCursor: next < fixtureProfile.ids.length ? String(next) : null, hasMore: next < fixtureProfile.ids.length } };
@@ -310,6 +310,88 @@ test('Pause, Skip and Stop invalidate an ENTRY_START already waiting for backgro
   });
 });
 
+test('a source-preparation server wait persists and refuses Resume before its deadline without changing ownership or making requests', async t => {
+  let now = 1_000_000; t.mock.method(Date, 'now', () => now);
+  const f = fixture({ identifyError: { code: 'RATE_LIMITED', message: 'Instagram asked you to wait.', retryAfterMs: 5000 } });
+  const run = await start(f, draft(['alpha']));
+  const refused = await f.queue('ENTRY_START', { runId: run.id, entryId: run.entries[0].id });
+  assert.equal(refused.ok, false); assert.equal(refused.error.code, 'RATE_LIMITED');
+  assert.equal(refused.error.retryAfterMs, 5000); assert.equal(refused.error.retryAt, now + 5000);
+  const paused = await f.store.getRun(run.id);
+  assert.equal(paused.state, 'paused'); assert.equal(paused.entries[0].state, 'needs_attention');
+  for (const error of [paused.error, paused.entries[0].error]) {
+    assert.equal(error.retryAfterMs, 5000); assert.equal(error.retryAt, now + 5000);
+  }
+  assert.equal((await f.queue('REPORT', { runId: run.id, entryId: run.entries[0].id })).report.error.retryAt, now + 5000);
+  const owner = plain(f.state.session[QUEUE_OWNER]), ownerWrites = f.state.ownerWrites, calls = f.state.sourceCalls.length;
+  now += 1000;
+  const early = await f.queue('RESUME', { runId: run.id });
+  assert.equal(early.ok, false); assert.equal(early.error.code, 'RATE_LIMITED'); assert.equal(early.error.retryAfterMs, 4000);
+  assert.deepEqual(f.state.session[QUEUE_OWNER], owner); assert.equal(f.state.ownerWrites, ownerWrites);
+  assert.deepEqual(await f.store.getRun(run.id), paused); assert.equal(f.state.sourceCalls.length, calls);
+  // Source lifecycle messages may replace the run message; the entry still owns
+  // the same server deadline and must prevent a new source request.
+  await f.store.updateRun(run.id, { error: { code: 'SOURCE_CHANGED', message: 'The source changed.' } });
+  const beforeSecondResume = await f.store.getRun(run.id);
+  assert.equal((await f.queue('RESUME', { runId: run.id })).error.code, 'RATE_LIMITED');
+  assert.deepEqual(await f.store.getRun(run.id), beforeSecondResume);
+  assert.deepEqual(f.state.session[QUEUE_OWNER], owner); assert.equal(f.state.sourceCalls.length, calls);
+  now += 4000; delete f.state.identifyError;
+  const resumed = await f.queue('RESUME', { runId: run.id }); assert.equal(resumed.ok, true, JSON.stringify(resumed));
+  assert.equal(resumed.run.state, 'running'); assert.equal(f.state.sourceCalls.length, calls);
+  const next = await startEntry(f, resumed.run); assert.equal(next.job.profile.username, 'alpha');
+  assert.equal(next.run.entries[0].error, null); assert.equal(f.state.downloads.length, 0); assert.equal(f.state.nativeWrites, 0);
+});
+
+test('source-preparation waits are bounded and Stop remains available during the wait', async t => {
+  const now = 2_000_000; t.mock.method(Date, 'now', () => now);
+  const f = fixture({ identifyError: { code: 'RATE_LIMITED', message: 'Wait before trying again.', retryAfterMs: 10 * 86_400_000 } });
+  const run = await start(f, draft(['alpha']));
+  const refused = await f.queue('ENTRY_START', { runId: run.id, entryId: run.entries[0].id });
+  assert.equal(refused.error.retryAfterMs, 86_400_000); assert.equal(refused.error.retryAt, now + 86_400_000);
+  const paused = await f.store.getRun(run.id);
+  assert.equal(paused.error.retryAfterMs, 86_400_000); assert.equal(paused.entries[0].error.retryAt, now + 86_400_000);
+  const calls = f.state.sourceCalls.length;
+  const stopped = await f.queue('STOP', { runId: run.id }); assert.equal(stopped.ok, true, JSON.stringify(stopped));
+  assert.equal(stopped.run.state, 'stopped'); assert.equal(f.state.session[QUEUE_OWNER].active, false);
+  assert.equal(f.state.sourceCalls.length, calls); assert.equal(f.state.downloads.length, 0); assert.equal(f.state.nativeWrites, 0);
+});
+
+test('a server wait encountered while reopening a lost source pauses and fences that Resume path too', async t => {
+  let now = 3_000_000; t.mock.method(Date, 'now', () => now);
+  const f = fixture(), run = await start(f, draft(['alpha'])), { job } = await startEntry(f, run);
+  await f.chrome.tabs.remove(job.queue.sourceTabId); await cleanupProfileQueueTab(job.queue.sourceTabId, { closed: true });
+  f.state.identifyError = { code: 'RATE_LIMITED', message: 'Wait before reopening this profile.', retryAfterMs: 2000 };
+  const refused = await f.queue('RESUME', { runId: run.id }); assert.equal(refused.ok, false); assert.equal(refused.error.code, 'RATE_LIMITED');
+  const paused = await f.store.getRun(run.id), owner = plain(f.state.session[QUEUE_OWNER]);
+  assert.equal(paused.state, 'paused'); assert.equal(paused.error.retryAt, now + 2000);
+  assert.equal(owner.control, 'paused'); assert.equal(owner.sourceLost, true); assert.equal(owner.childJobId, job.jobId);
+  const calls = f.state.sourceCalls.length, writes = f.state.ownerWrites;
+  assert.equal((await f.queue('RESUME', { runId: run.id })).error.code, 'RATE_LIMITED');
+  assert.equal(f.state.sourceCalls.length, calls); assert.equal(f.state.ownerWrites, writes);
+  assert.deepEqual(f.state.session[QUEUE_OWNER], owner); assert.deepEqual(await f.store.getRun(run.id), paused);
+  now += 2000; delete f.state.identifyError;
+  const resumed = await f.queue('RESUME', { runId: run.id }); assert.equal(resumed.ok, true, JSON.stringify(resumed));
+  assert.equal(resumed.run.state, 'running'); assert.equal(resumed.run.entries[0].state, 'running'); assert.equal(resumed.run.entries[0].error, null);
+  assert.equal(f.state.session[QUEUE_OWNER].childJobId, job.jobId); assert.equal(f.state.session[QUEUE_OWNER].sourceLost, false);
+  assert.equal((await f.bulk('PAGE', job, { cursor: null })).ok, true);
+  assert.equal(f.state.downloads.length, 0); assert.equal(f.state.nativeWrites, 0);
+});
+
+test('source-preparation errors without a valid server wait keep manual Resume available', async t => {
+  for (const retryAfterMs of [undefined, 0, -1, Infinity, NaN]) await t.test(String(retryAfterMs), async () => {
+    const f = fixture({ identifyError: { code: 'RATE_LIMITED', message: 'Try again later.', retryAfterMs } });
+    const run = await start(f, draft(['alpha']));
+    const refused = await f.queue('ENTRY_START', { runId: run.id, entryId: run.entries[0].id });
+    assert.equal(refused.ok, false); assert.equal(refused.error.retryAt, undefined);
+    assert.equal((await f.store.getRun(run.id)).error.retryAt, undefined);
+    delete f.state.identifyError;
+    const resumed = await f.queue('RESUME', { runId: run.id }); assert.equal(resumed.ok, true, JSON.stringify(resumed));
+    assert.equal((await startEntry(f, resumed.run)).job.profile.username, 'alpha');
+    assert.equal(f.state.downloads.length, 0); assert.equal(f.state.nativeWrites, 0);
+  });
+});
+
 test('a late discovery result cannot register the old profile after handoff to the next source document', async () => {
   const f = fixture(); let run = await start(f); const { job } = await startEntry(f, run);
   const paging = deferred(), gate = deferred(); f.state.paging = paging; f.state.pageGate = gate;
@@ -395,6 +477,72 @@ test('retry cannot acquire queue ownership while an ordinary bulk job owns the w
   assert.equal(retry.ok, false);
   assert.equal(f.state.session[QUEUE_OWNER].active, false);
   assert.equal(f.state.session[BULK_ACTIVE].jobId, ordinary.job.jobId);
+});
+
+async function failedRetry(f, sourceExhausted) {
+  let run = await start(f, draft(['alpha'], { defaultLimit: 3 }));
+  const first = await startEntry(f, run), page = await childPage(f, first.job), item = page.items[0];
+  assert.equal((await f.bulk('RESOLVE', first.job, { item, attemptId: 'before-retry' })).ok, true);
+  assert.equal((await f.bulk('ITEM_RESULT', first.job, { item, attemptId: 'before-retry',
+    result: { state: 'failed', error: { code: 'FILE_FAILED', message: 'Fixture write failed' } } })).ok, true);
+  run = await finish(f, run, first.job, { state: 'completed_with_errors', completionReason: 'feed_exhausted', sourceExhausted });
+  const retried = await f.queue('RETRY', { runId: run.id }); assert.equal(retried.ok, true, JSON.stringify(retried));
+  return { run: retried.run, ...(await startEntry(f, retried.run)) };
+}
+
+test('exhausting a failed-ID retry list cannot turn an incomplete profile scan into an exhausted source', async () => {
+  const f = fixture(), { run, job } = await failedRetry(f, false);
+  const sourcePages = f.state.sourceCalls.filter(call => call.action === 'page').length;
+  const runner = await runnerFor(f, run, job, { name: 'Selected library root' }); runner.start();
+  const completed = await runner.waitForIdle(); assert.equal(completed.counts.saved, 1);
+  assert.equal(completed.sourceExhausted, true, 'the retry adapter has exhausted only its failed-ID list');
+  assert.equal(f.state.sourceCalls.filter(call => call.action === 'page').length, sourcePages);
+  const progress = await f.queue('PROGRESS', { runId: run.id, entryId: run.entries[0].id, jobId: job.jobId, snapshot: plain(completed) });
+  assert.equal(progress.ok, true, JSON.stringify(progress)); assert.equal(progress.run.entries[0].sourceExhausted, false);
+  await runner.finalize();
+  const finished = await f.queue('ENTRY_FINISH', { runId: run.id, entryId: run.entries[0].id, jobId: job.jobId, summary: plain(completed) });
+  assert.equal(finished.ok, true, JSON.stringify(finished)); assert.equal(finished.run.entries[0].sourceExhausted, false);
+  assert.equal((await f.queue('REPORT', { runId: run.id, entryId: run.entries[0].id })).report.sourceExhausted, false);
+});
+
+test('stopping or skipping a retry preserves an already exhausted original profile scan', async t => {
+  for (const action of ['STOP', 'SKIP']) await t.test(action, async () => {
+    const f = fixture(), { run } = await failedRetry(f, true);
+    const controlled = await f.queue(action, { runId: run.id, entryId: run.entries[0].id, summary: { sourceExhausted: false } });
+    assert.equal(controlled.ok, true, JSON.stringify(controlled));
+    assert.equal(controlled.run.entries[0].sourceExhausted, true);
+    assert.equal((await f.queue('REPORT', { runId: run.id, entryId: run.entries[0].id })).report.sourceExhausted, true);
+    assert.equal(f.state.nativeWrites, 0); assert.equal(f.state.downloads.length, 0);
+  });
+});
+
+test('a new host recovers an interrupted native reservation and releases its stale child before a fresh queue', async () => {
+  const f = fixture(), run = await start(f, draft(['alpha'])), { job } = await startEntry(f, run);
+  const page = await childPage(f, job), item = page.items[0], attemptId = 'host-lost-native';
+  const resolved = await f.bulk('RESOLVE', job, { item, attemptId }); assert.equal(resolved.ok, true, JSON.stringify(resolved));
+  const filename = resolved.filename.replace(/\.mp4$/, ' (1).mp4');
+  assert.equal((await f.bulk('NATIVE_INTENT', job, { item, attemptId, filename })).ok, true);
+  await cleanupProfileQueueTab(hostId, { status: 'loading' });
+  assert.equal(f.state.session[BULK_ACTIVE].active, false);
+  assert.equal(f.state.session[BULK_ACTIVE].reservationMediaId, item.mediaId);
+  f.state.tabs.get(hostId).documentId = 'new-host-document';
+  const nextSender = sender(hostId, 'new-host-document');
+  const send = (action, values = {}) => f.queue(action, values, nextSender);
+  const latest = await send('LATEST'); assert.equal(latest.run.state, 'interrupted'); assert.equal(latest.owned, false);
+  assert.equal((await send('START', { draft: draft(['alpha']), options: { destination: 'folder', skipExisting: true } })).error.code, 'JOB_BUSY');
+  const lease = await send('LEASE_BEGIN', { kind: 'recovery', runId: run.id }); assert.equal(lease.ok, true, JSON.stringify(lease));
+  const info = await send('RECOVERY_INFO', { runId: run.id });
+  assert.equal(info.ok, true); assert.equal(info.recovery.item.filename, filename);
+  const proof = { state: 'saved', filename, bytesWritten: 2048 };
+  const recovered = await send('RECONCILE', { runId: run.id, result: proof }); assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.run.state, 'interrupted'); assert.equal(recovered.run.committedNewSaves, 1);
+  assert.equal(recovered.run.reservation, null); assert.equal(f.state.session[BULK_ACTIVE].reservationMediaId, null);
+  assert.equal((await send('RECONCILE', { runId: run.id, result: proof })).run.committedNewSaves, 1);
+  assert.equal((await send('LEASE_END', { leaseId: lease.leaseId })).ok, true);
+  const fresh = await send('START', { draft: draft(['alpha']), options: { destination: 'folder', skipExisting: true } });
+  assert.equal(fresh.ok, true, JSON.stringify(fresh)); assert.notEqual(fresh.run.id, run.id); assert.equal(fresh.run.committedNewSaves, 0);
+  assert.equal(f.state.sourceCalls.filter(call => call.action === 'resolve').length, 1);
+  assert.equal(f.state.nativeWrites, 0); assert.equal(f.state.downloads.length, 0);
 });
 
 test('an accepted browser ID survives queue-ledger failure even with another rapid older copy', async () => {

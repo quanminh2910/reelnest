@@ -38,6 +38,8 @@ function sanitizeError(value) {
   return { code: typeof value.code === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(value.code) ? value.code : 'QUEUE_ERROR',
     ...(typeof value.stage === 'string' && /^[A-Za-z0-9_-]{1,60}$/.test(value.stage) ? { stage: value.stage } : {}),
     message: sanitizedText(value.message || 'The queue operation could not finish.'),
+    ...(Number.isFinite(value.retryAfterMs) && value.retryAfterMs > 0 ? { retryAfterMs: Math.min(Math.ceil(value.retryAfterMs), 86_400_000) } : {}),
+    ...(Number.isSafeInteger(value.retryAt) && value.retryAt > 0 ? { retryAt: value.retryAt } : {}),
     ...(value.cleanupFailed === true ? { cleanupFailed: true } : {}) };
 }
 

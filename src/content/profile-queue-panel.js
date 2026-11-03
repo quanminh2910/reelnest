@@ -221,7 +221,10 @@
     function updateRun(next) { accept(next); renderResults(); notify(); }
     function completionMessage() {
       const count = run?.committedNewSaves || 0;
-      if (run?.completionReason === "queue_limit_reached") return `Queue limit reached · ${count} new videos saved. Remaining profiles were not run.`;
+      if (run?.completionReason === "queue_limit_reached") {
+        const unrun = run.entries.some(entry => ["not_run", "pending"].includes(entry.state));
+        return `Queue limit reached · ${count} new videos saved.${unrun ? " Remaining profiles were not run." : ""}`;
+      }
       if (run?.state === "stopped") return `Queue stopped. ${count} saved videos were kept.`;
       return `${labels[run?.state] || "Queue finished"} · ${count} new videos saved. Saved reports are available below.`;
     }

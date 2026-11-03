@@ -248,6 +248,20 @@ test('loading saved results never starts a previous queue automatically', async 
   assert.match(f.role('queue-status').textContent, /Interrupted/);
 });
 
+test('saved queue-limit results mention unrun profiles only when their entry states show some remain', async t => {
+  for (const lastState of ['completed', 'not_run', 'pending']) await t.test(lastState, async () => {
+    const f = await fixture({ run: { id: 'previous-limited', state: 'completed', completionReason: 'queue_limit_reached',
+      currentIndex: 1, committedNewSaves: 2, draft: { totalLimit: 2 },
+      entries: [{ id: 'a', username: 'creator_a', state: 'completed', committedNewSaves: 1 },
+        { id: 'b', username: 'creator_b', state: lastState, committedNewSaves: lastState === 'completed' ? 1 : 0 }] } });
+    const message = f.role('queue-status').textContent;
+    assert.match(message, /Queue limit reached.*2 new videos saved\./);
+    if (lastState === 'completed') assert.doesNotMatch(message, /Remaining profiles were not run/);
+    else assert.match(message, /Remaining profiles were not run/);
+    assert.equal(f.state.requests.some(value => value.type.endsWith('_START')), false);
+  });
+});
+
 test('a lost Start acknowledgement recovers only the newly owned run without starting another queue', async () => {
   const f = await fixture({ failStartAck: 1 });
   await f.role('queue-start').event('click');
