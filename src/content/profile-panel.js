@@ -75,10 +75,10 @@
     button{display:inline-flex;align-items:center;gap:8px;border:1px solid #29634c;border-radius:9px;
       background:#1c523e;color:#fff;min-height:38px;padding:9px 14px;font:600 13px/1.3 "Segoe UI",system-ui,sans-serif;
       cursor:pointer;box-shadow:0 3px 12px #12352514}button:hover{background:#143e2e}
-    button:focus-visible{outline:3px solid #8ecba8;outline-offset:3px}.mark{font-size:16px;line-height:1}
+    button:focus-visible{outline:3px solid #8ecba8;outline-offset:3px}.mark{display:block;width:20px;height:20px;flex:none;border-radius:5px}
   `;
   const launcher = el("button", "", { type: "button", "aria-haspopup": "dialog", "aria-expanded": "false" });
-  launcher.append(el("span", "↓", { class: "mark", "aria-hidden": "true" }), el("span", "ReelNest"));
+  launcher.append(el("img", "", { src: chrome.runtime.getURL("icons/icon48.png"), class: "mark", alt: "", width: "20", height: "20" }), el("span", "ReelNest"));
   installStyles(launcherRoot, launcherStyles);
   launcherRoot.append(launcher);
 
@@ -94,8 +94,8 @@
       font:13px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif;overscroll-behavior:contain}
     dialog::backdrop{background:#0d211f55;backdrop-filter:blur(2px)}
     header{display:flex;align-items:center;gap:11px;padding:22px 22px 18px;background:white;border-bottom:1px solid #e1eae3}
-    .brand-mark{display:grid;place-items:center;flex:none;width:36px;height:36px;background:#1c523e;border-radius:11px;
-      color:#fff;font-size:23px;line-height:1}h2{margin:0;font-size:18px;letter-spacing:-.5px;color:#173e2c}
+    .brand-mark{display:block;flex:none;width:36px;height:36px;border-radius:9px}
+    h2{margin:0;font-size:18px;letter-spacing:-.5px;color:#173e2c}
     .subtitle{margin:2px 0 0;color:#72877a;font-size:11px}.close{margin-left:auto;flex:none;border:none;background:transparent;
       color:#718177;width:30px;height:30px;border-radius:7px;font:24px/1 system-ui;cursor:pointer}.close:hover{background:#eff4f0}
     main{padding:20px 22px}section+section{margin-top:22px}.section-heading{display:flex;align-items:center;gap:8px;
@@ -133,7 +133,7 @@
   const brand = el("div");
   brand.append(el("h2", "ReelNest", { id: "reel-saver-title" }), el("p", "Download control panel", { class: "subtitle" }));
   const close = el("button", "×", { type: "button", class: "close", "aria-label": "Close ReelNest", "data-role": "close" });
-  header.append(el("div", "↓", { class: "brand-mark", "aria-hidden": "true" }), brand, close);
+  header.append(el("img", "", { src: chrome.runtime.getURL("icons/icon128.png"), class: "brand-mark", alt: "", width: "36", height: "36" }), brand, close);
   const main = el("main");
   const context = el("p", "", { class: "context", "data-role": "context" });
   const destinationSection = el("section");
