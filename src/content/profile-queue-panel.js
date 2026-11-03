@@ -59,7 +59,6 @@
     settings.append(batchRow, defaultLimit.row, totalLimit.row);
     const explanation = make("p", "Counts confirmed new saves. Already saved videos and failures do not use either limit. Profiles follow Instagram’s returned order.", { class: "hint" });
     const tabNotice = make("p", "Starting opens one background Instagram tab. Keep this control tab open; each profile uses the selected save location.", { class: "hint" });
-    const replaceNotice = make("p", "Starting a new queue replaces its previous saved results. Export reports below first if you want to keep them.", { class: "hint", "data-role": "queue-replace-notice", hidden: "" });
     const status = make("p", "", { class: "status", "data-role": "queue-status", role: "status", "aria-live": "polite", "aria-atomic": "true" });
     const progress = make("p", "", { class: "hint queue-progress", "data-role": "queue-progress", hidden: "" });
     const start = make("button", "Start queue", { type: "button", class: "download", "data-role": "queue-start" });
@@ -73,7 +72,7 @@
     const controls = make("div", "", { class: "queue-actions" }); controls.append(pause, resume, skip, stop, source, retry, exportQueue);
     const results = make("ol", "", { class: "queue-results", "data-role": "queue-results", "aria-label": "Latest queue results" });
     section.append(heading, inputLabel, input, addActions, inputErrors, empty, draftList, settings, explanation,
-      tabNotice, replaceNotice, progress, status, start, controls, results);
+      tabNotice, progress, status, start, controls, results);
     const css = `
       .profile-queue{margin-top:22px;padding:16px;border:1px solid #d6e4da;border-radius:12px;background:#f0f7f2}
       .profile-queue textarea,.profile-queue input{width:100%;border:1px solid #d1dfd5;border-radius:7px;background:#fff;color:#284d35;padding:8px;font:inherit;font-size:12px}
@@ -213,7 +212,6 @@
       retry.hidden = !startedHere || ownsRun || !run || !(run.entries || []).some(entry => entry.counts?.failed > 0);
       retry.disabled = active || isSingleBusy() || run?.completionReason === "queue_limit_reached";
       exportQueue.hidden = !run; exportQueue.disabled = controlPending;
-      replaceNotice.hidden = !run || ownsRun;
       progress.hidden = !run;
       if (run) progress.textContent = `Profile ${Math.min((run.currentIndex || 0) + 1, run.entries.length)} of ${run.entries.length} · ${run.committedNewSaves || 0} new videos saved${run.draft?.totalLimit == null ? "" : ` of ${run.draft.totalLimit}`}${latestSnapshot?.active ? ` · ${latestSnapshot.active.shortcode}` : ""}`;
       status.textContent = messageText; status.dataset.tone = messageTone;
@@ -223,7 +221,7 @@
       const count = run?.committedNewSaves || 0;
       if (run?.completionReason === "queue_limit_reached") {
         const unrun = run.entries.some(entry => ["not_run", "pending"].includes(entry.state));
-        return `Queue limit reached · ${count} new videos saved.${unrun ? " Remaining profiles were not run." : ""}`;
+        return `Done · ${count} new videos saved.${unrun ? " Remaining profiles were not run." : ""}`;
       }
       if (run?.state === "stopped") return `Queue stopped. ${count} saved videos were kept.`;
       return `${labels[run?.state] || "Queue finished"} · ${count} new videos saved. Saved reports are available below.`;

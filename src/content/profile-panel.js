@@ -248,13 +248,13 @@
     if (selectedDestination === "chosen") {
       folderName.textContent = libraryDestination?.rootHandle === directoryHandle
         ? `${directoryHandle.name} / ${libraryDestination.folderName}` : directoryHandle?.name || "Choose a library folder to continue";
-      destinationHint.textContent = "Each profile gets its own folder for videos and download history. Select this root folder again after a tab reload; saved history stays on disk.";
+      destinationHint.textContent = "Each profile gets its own folder for videos and download history. Saved history stays on disk.";
     } else if (selectedDestination === "ask") {
       folderName.textContent = "Choose a location for each video";
       destinationHint.textContent = "Chrome will open its Save As dialog when you download.";
     } else {
       folderName.textContent = "Downloads / Reel Saver";
-      destinationHint.textContent = "Profile downloads remember saved Reels and check their files through Chrome history. Import an older report to recognize earlier downloads; additional copies get unique names.";
+      destinationHint.textContent = "Profile downloads remember saved Reels and check their files through used library folder.";
     }
     if (!globalThis.ReelSaverFolderWriter?.isSupported()) {
       chooseFolder.title = "This browser does not support choosing a folder here. Use Ask where to save instead.";
