@@ -120,6 +120,7 @@ try {
   const exceptions = [];
   const executionContexts = [];
   let nextId = 0;
+  let installQueueSources = false;
   function send(method, params = {}, sessionId) {
     const id = ++nextId;
     return new Promise((resolve, reject) => {
@@ -136,6 +137,19 @@ try {
       pending.delete(message.id);
       clearTimeout(request.timer);
       message.error ? request.reject(new Error(message.error.message)) : request.resolve(message.result);
+    } else if (message.method === 'Target.attachedToTarget' && installQueueSources && message.params.targetInfo.type === 'page') {
+      const attached = message.params.sessionId;
+      (async()=>{
+        await send('Runtime.enable',{},attached);
+        await send('Page.enable',{},attached);
+        await send('Fetch.enable',{patterns:[{urlPattern:'https://www.instagram.com/*',resourceType:'Document',requestStage:'Request'}]},attached);
+        await send('Runtime.runIfWaitingForDebugger',{},attached);
+        // The network request may precede automatic debugger attachment. Repeat
+        // only the fixture helper's initial navigation after interception exists.
+        if(message.params.targetInfo.targetId!==targetId && message.params.targetInfo.url.startsWith('https://www.instagram.com/')) {
+          await send('Page.navigate',{url:message.params.targetInfo.url},attached);
+        }
+      })().catch(error=>exceptions.push(error.message));
     } else if (message.method === 'Runtime.executionContextCreated') {
       executionContexts.push(message.params.context);
     } else if (message.method === 'Runtime.exceptionThrown') {
@@ -189,6 +203,7 @@ try {
     await key('Home', 'Home', 36);
     for (let count = 0; count < index; count++) await key('ArrowDown', 'ArrowDown', 40);
     await key('Enter', 'Enter', 13);
+    await waitFor(`${query('[data-role=destination]')}.value===${JSON.stringify(value)} && !${query('[data-role=destination]')}.disabled`,'destination preference committed');
   }
   async function setLimit(value) {
     await click(query('[data-role=bulk-limit-mode]'));
@@ -529,6 +544,64 @@ try {
   assert.equal(await mediaInfoCount(),beforeLegacyLookup);
   assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeLegacyFiles);
   console.log('PASS installed browser report preview/confirmation recovers old coauthor/underscore identity without a video download');
+
+  // The parent remains on its original document and routes source queries to
+  // one real extension-created tab. Runtime, IndexedDB and OPFS stay real.
+  installQueueSources = true;
+  await send('Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:true,flatten:true,
+    filter:[{type:'page',exclude:false},{exclude:true}]});
+  const queueDraft={schemaVersion:1,batchSize:35,defaultLimit:1,totalLimit:2,entries:[
+    {id:'queue-first',username:'example_creator',limitMode:'inherit',maxNewVideos:null},
+    {id:'queue-second',username:'second_creator',limitMode:'inherit',maxNewVideos:null}]};
+  async function setQueueDraft(draft){
+    const response=await isolated(`chrome.runtime.sendMessage({type:'REEL_SAVER_QUEUE_DRAFT_SET',draft:${JSON.stringify(draft)}})`);
+    assert.equal(response.ok,true,JSON.stringify(response));
+    await click(query('[data-role=close]'));await click(launcher);
+    await click(query('[data-role=profile-queue-view]'));
+    await waitFor(`!${query('[data-role=queue-start]')}.disabled`,'queue draft ready');
+  }
+  // Use unseen IDs in source feeds; the host's unrelated feed must stay intact.
+  const hostPath=await evaluate('location.pathname');
+  const beforeQueueDownloads=await workerEval('globalThis.__browserHistoryFixture.length');
+  await setQueueDraft(queueDraft);
+  if(await evaluate(`${query('[data-role=skip-existing]')}.checked`)) await click(query('[data-role=skip-existing]'));
+  await click(query('[data-role=queue-start]'));
+  await waitFor(`/^Queue (finished|limit reached)/.test(${query('[data-role=queue-status]')}.textContent) && !${query('[data-role=queue-start]')}.disabled`,'two actual background-source profiles finish');
+  const firstQueue=(await isolated("chrome.runtime.sendMessage({type:'REEL_SAVER_QUEUE_LATEST'})")).run;
+  assert.equal(firstQueue.committedNewSaves,2);
+  assert.deepEqual(firstQueue.entries.map(entry=>entry.committedNewSaves),[1,1]);
+  assert.equal(await evaluate('location.pathname'),hostPath,'queue host never navigates');
+  assert.equal(await workerEval('globalThis.__browserHistoryFixture.length'),beforeQueueDownloads+2);
+  const queueJournal=await workerEval("chrome.storage.session.get('reelnest:queue-owner:v1').then(v=>v['reelnest:queue-owner:v1'])");
+  assert.equal(queueJournal.active,false);
+  assert.equal(await workerEval(`chrome.tabs.get(${queueJournal.sourceTabId}).then(()=>false,()=>true)`),true,'owned helper tab closed after completion');
+  console.log('PASS installed profile queue: stable host, one reused background source, two profiles and exact total cap');
+
+  // Disable skipping deliberately for a bounded copy into each real profile
+  // child, proving the same selected library capability survives handoff.
+  await selectDestination('chosen');
+  const filesBeforeQueue=(await mp4Files()).length;
+  if(await evaluate(`${query('[data-role=skip-existing]')}.checked`)) await click(query('[data-role=skip-existing]'));
+  await click(query('[data-role=queue-start]'));
+  await waitFor(`/^Queue (finished|limit reached)/.test(${query('[data-role=queue-status]')}.textContent) && !${query('[data-role=queue-start]')}.disabled`,'same-root two-profile native queue');
+  const nativeQueue=(await isolated("chrome.runtime.sendMessage({type:'REEL_SAVER_QUEUE_LATEST'})")).run;
+  assert.equal(nativeQueue.committedNewSaves,2);
+  assert.deepEqual(nativeQueue.entries.map(entry=>entry.committedNewSaves),[1,1]);
+  assert.equal((await mp4Files()).length,filesBeforeQueue+2);
+  assert.equal(await evaluate('location.pathname'),hostPath);
+  console.log('PASS installed Library queue: one selected root, two profile children, serialized writes and released caches');
+  await page('Page.reload');
+  await reconnectFixture('queue report persistence after host reload');
+  await click(query('[data-role=profile-queue-view]'));
+  await waitFor(`${query('[data-role=queue-results]')}.children.length===2`,'persistent latest queue results');
+  const persistedQueue=(await isolated("chrome.runtime.sendMessage({type:'REEL_SAVER_QUEUE_LATEST'})")).run;
+  assert.equal(persistedQueue.id,nativeQueue.id);
+  assert.equal(persistedQueue.committedNewSaves,2);
+  const queueReport=(await isolated(`chrome.runtime.sendMessage({type:'REEL_SAVER_QUEUE_REPORT',runId:${JSON.stringify(nativeQueue.id)}})`)).report;
+  assert.equal(queueReport.type,'reelnest-profile-queue');
+  assert.equal(queueReport.profiles.length,2);
+  assert.ok(queueReport.profiles.every(profile=>profile.report.version===1&&profile.report.items.some(item=>item.state==='saved'&&item.bytesWritten>0)));
+  console.log('PASS queue reports survive document loss without autoplay and retain compatible per-profile saved records');
   const artifacts=path.join(root,'artifacts');await mkdir(artifacts,{recursive:true});
   const capture=await page('Page.captureScreenshot',{format:'png'});
   await writeFile(path.join(artifacts,'bulk-extension-preview.png'),Buffer.from(capture.data,'base64'));

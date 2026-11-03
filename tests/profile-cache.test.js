@@ -37,6 +37,21 @@ async function record(session, reel = item, filename = 'video.mp4') {
   await session.commitSaved(reel, { filename, bytesWritten: bytes.byteLength });
 }
 
+test('recovery-only library access requires an existing verified child and never initializes a wrong root', async () => {
+  const cache = environment();
+  const wrongRoot = memoryDirectory();
+  await assert.rejects(cache.openLibrary(wrongRoot, profile, { existingOnly: true }), { code: 'CACHE_RECONCILIATION_REQUIRED' });
+  assert.deepEqual(wrongRoot.names, []);
+  const original = memoryDirectory();
+  const session = await cache.openLibrary(original, profile);
+  await record(session);
+  session.close();
+  const recovered = await cache.openLibrary(original, { ...profile, username: 'renamed.creator' }, { existingOnly: true });
+  assert.equal(recovered.folderName, profile.username);
+  assert.equal((await recovered.verifyItem(item)).filename, 'video.mp4');
+  recovered.close();
+});
+
 test('clearing profile history preserves videos, other profiles and library mappings', async () => {
   const root = memoryDirectory();
   const cache = environment();

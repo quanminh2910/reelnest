@@ -6,6 +6,9 @@
 # Local implementation plans
 /plans/
 
+# Original icon backups
+/icons/backup-original/
+
 # Dependencies and tool caches
 node_modules/
 .cache/

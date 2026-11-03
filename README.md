@@ -1,6 +1,6 @@
 # ReelNest
 
-A Chrome extension for saving Instagram Reels individually or in profile batches, with optional download limits, automatic profile folders, and persistent download history. This is an independent extension in a separate folder; the archived ESUIT packages are unchanged.
+A Chrome extension for saving Instagram Reels individually, in profile batches, or from an ordered list of profiles, with download limits, automatic profile folders, and persistent download history. This is an independent extension in a separate folder; the archived ESUIT packages are unchanged.
 
 ## Install locally
 
@@ -13,19 +13,40 @@ There is no build step or dependency installation. Node.js is needed only for de
 
 ### Update an existing installation
 
-On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.5.2.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+On the extensions page, click **Reload** for ReelNest, then refresh open Instagram tabs. Allow Instagram site access if Chrome asks. The old ZIP releases are preserved; load the current `reelnest` folder or extract **reelnest-0.6.0.zip**. Refreshing replaces the previous content scripts. Choose your central library folder again after refreshing, then start a new bulk job.
+
+Version **0.6.0** adds the **Profile queue** view: ordered profiles, per-profile limit overrides, an optional total cap, one reused background source tab, and locally saved results. Both save locations reuse the existing download history. The original Instagram tab stays open as the control and folder-writing host.
 
 Version **0.5.2** adds persistent Browser Downloads receipts keyed by numeric profile and Reel IDs. Repeated runs recognize coauthored Reels and profile username changes. New filenames preserve the complete shortcode, including leading/trailing underscores. An explicit Browser Downloads report import can recover older ambiguous filenames after matching the report to completed downloads in Chrome.
 
 Version **0.5.1** fixes repeated limited runs in **Browser Downloads**: with **Skip videos already downloaded** enabled, a run that saves 25 can be followed by a limit of 10 to save up to 10 additional Reels. Completed earlier ReelNest downloads are recognized from Chrome's download history, including downloads made before this fix. Update by reloading the existing installation at the same unpacked folder path; recognition checks the extension ID that created each download. Removing/reinstalling at a different path can change that ID.
 
-Version **0.5.0** adds an optional maximum number of newly saved videos for a single-profile bulk run. **Unlimited** preserves the previous behavior. A custom limit applies to both Library folder and Browser Downloads, survives pause/resume, and appears in the exported report. Cached videos and failed attempts do not consume it. Profile queues are planned separately.
+Version **0.5.0** adds an optional maximum number of newly saved videos for a single-profile bulk run. **Unlimited** preserves the previous behavior. A custom limit applies to both Library folder and Browser Downloads, survives pause/resume, and appears in the exported report. Cached videos and failed attempts do not consume it.
 
 Version **0.4.2** renames Reel Saver to **ReelNest**. The project folder is named `reelnest`. If your unpacked extension points to the previous `reel-saver` path, remove that old entry and load the `reelnest` folder, then refresh Instagram. Existing library folder names, `.reel-saver-*.json` metadata, and older download reports remain compatible. Keep using your current library root; it does not need to be renamed. Browser Downloads continues saving under `Downloads/Reel Saver`.
 
 Version **0.4.0** adds profile libraries, verified duplicate skipping, persistent per-profile history, and an explicit report importer for existing videos. Both profile-panel single saves and bulk saves use the same library. Browser Downloads and the toolbar popup keep their existing behavior.
 
 Version **0.4.1** adds **Clear profile history** on profile pages. It clears that profile's saved download records from both cache files while keeping its videos and the other profile collections.
+
+## Multi-profile queue
+
+1. Open an Instagram profile, open ReelNest, and choose **Library folder** or **Browser Downloads**.
+2. Switch to **Profile queue**. Paste usernames, `@usernames`, or HTTPS Instagram profile/Reels URLs, one per line; or click **Add current profile**. Invalid lines are reported individually. A draft supports up to 100 profiles.
+3. Review the order with the up/down buttons. Set a default new-video limit, optional **Custom limit** or **Unlimited** overrides for individual rows, and an optional total queue limit. Custom limits are 1–50,000; Unlimited is the default. Batch size defaults to 35.
+4. Click **Start queue**. Keep this control tab open. ReelNest opens one background Instagram tab and reuses it for the profiles in order. **Show source tab** brings it forward when Instagram needs attention.
+
+One profile and one video run at a time. Cache hits and failures consume neither cap. For example, default 25, second-profile override 10, third-profile Unlimited, and total 60 can produce 25 / 10 / 25 saves. Later profiles remain **Not run**. The selection follows Instagram's returned order, including pinned Reels.
+
+**Pause queue** finishes the current operation before scheduling more work. **Resume** keeps the same counts and remaining limits. **Skip profile** settles its transfer, keeps completed files, and advances. **Stop queue** settles the current output and leaves later profiles unrun. Closing the panel keeps the run active; refreshing or closing its control tab interrupts it. Login/challenge, rate limits, lost folder access, uncertain saves, and source-tab changes pause the queue. The destination never changes automatically.
+
+When Instagram supplies a wait deadline, **Resume** honors it, including between profiles. Without a supplied deadline, wait before resuming manually. **Stop queue** remains available during the wait.
+
+The draft and the latest run's results are kept locally. **Export profile report** produces the compatible version-1 report for that profile; **Export queue report** includes all profile reports and queue summaries. Export before starting another queue if you want to keep the previous results. Starting a new run resets allowances and replaces the previous archive. Reopening Chrome shows saved results and never automatically restarts a queue. Failed items can be retried in the original host document using their remaining original allowances; after losing that document, start an explicit new run instead.
+
+An interrupted save must be reconciled before replacing its results. Browser recovery checks the accepted Chrome download; Library recovery requires selecting the original root and verifies the exact profile's recorded file. Unknown or partial outputs remain blocked rather than starting another copy. This records history and does not resume the interrupted queue.
+
+The queue uses batch mode; **Scan all first** remains a Current profile feature. Settings and the profile list are frozen during a run. Results are bounded to 64 MiB for the latest queue and 16 MiB/50,000 discovered entries per profile; reaching a storage bound pauses the queue so you can stop and export reports before starting a smaller run.
 
 ## Profile library and download history
 
@@ -168,7 +189,7 @@ The download continues when the popup closes. Open the popup again on the same R
 
 ## Scope and limitations
 
-- Version 0.4 adds native profile libraries, per-profile history, duplicate skipping, and report migration to the bulk queue. The history survives a restart; the queue and pagination cursor do not. Pasted-link downloading and separate audio/video merging are outside this version.
+- Native profile libraries, browser receipts, the profile queue draft, and the latest queue's reports survive restart. Active downloads and pagination do not automatically resume. Separate audio/video merging and queues of individual Reel links are outside this version.
 - It uses the current Instagram session and an available progressive MP4. It does not sign in for you or access media unavailable to your account.
 - Instagram's internal media API and page structure can change. The extractor uses Instagram's existing media-info module when available and falls back to media data explicitly matched to the current Reel. Uncertain or mismatched media is rejected.
 - The selected quality is the highest-resolution progressive MP4 candidate found. Higher-resolution DASH-only sources are not merged in this version.
@@ -180,10 +201,10 @@ The download continues when the popup closes. Open the popup again on the same R
 | Permission | Purpose |
 | --- | --- |
 | `activeTab` | Keep the toolbar's current-Reel workflow available. |
-| Instagram host access | Show profile controls and resolve the Reel opened in that tab. |
-| `scripting` | Run the media lookup in that page. |
+| Instagram host access | Show profile controls and read the active profile in the registered source tab. |
+| `scripting` | Run media lookup in the registered Instagram document. |
 | `downloads` | Save the MP4 and check Chrome's download status. |
-| `storage` | Remember the browser destination preference and keep tab download IDs in session memory. |
+| `storage` | Keep preferences, the queue draft, download receipts, and active tab ownership. |
 
 The extension runs content scripts only on `instagram.com` and `www.instagram.com`, in the isolated extension world. It has no backend service, account system, analytics, or ESUIT server dependency, and it does not read cookies or passwords. Media requests and thumbnail loads go to Instagram/Meta hosts. A chosen folder handle stays inside the current tab's isolated script. Signed URLs are held briefly in worker memory and, for chosen-folder saves, passed only to the matching tab. Browser destination, bulk preferences, and bounded browser download receipts are stored locally in the extension. Receipts retain numeric identity, Chrome download ID, basename, size, and timestamp. The latest bulk ownership, discovered IDs, operation attempts, download IDs, file results, and normalized import preview are session-only; they support worker restart and prevent uncertain transfers from being blindly repeated. They do not automatically restore the queue after a refresh/restart. Chrome maintains normal browser download history. Direct folder writes appear in the panel instead of Chrome Downloads.
 
@@ -200,6 +221,7 @@ npm run test:browser
 npm run test:profile
 npm run test:bulk
 npm run test:extension
+npm run test:queue
 ```
 
 `check` validates the manifest, referenced assets, icon sizes, and JavaScript syntax. Tests cover media identity, extraction in a serialized page context, URL validation, navigation changes, duplicate requests, retries, and real download-state handling through mocked Chrome APIs.
@@ -209,6 +231,10 @@ npm run test:extension
 `test:profile` exercises the injected profile panel against local browser fixtures, including Instagram-style navigation and folder/download controls. The picker returns a real temporary origin-private directory handle. Media requests use fixtures, so the tests do not touch personal folders or Instagram accounts.
 
 `test:bulk` exercises the actual queue, panel, and stream writer against a local 82-item feed, including 35/35/12 batching, scan-all mode, pause/resume, retries, stops, lost acknowledgement recovery, and report import. It also checks custom-limit validation, cached/failed items, remaining allowance, Stop/completion races, consecutive limited Browser Downloads runs, and explicit browser report preview/confirm/cancel. `test:extension` loads the unpacked extension into an isolated Edge/Chromium profile and checks worker/content messaging, real origin-private filesystem writes, cache skips without new media requests, missing-file recovery, reload persistence, and two-profile isolation. Its limit cases verify no extra page/media lookup after the cap, compatible reports, a lost failure acknowledgement followed by Resume, and Stop during media lookup. A synthetic Chrome-download-history adapter additionally exercises the real worker/source/UI path for 25 saves followed by 10 different Reels, coauthor/underscore receipts in real extension local storage, profile/owner username changes, missing-file handling, and report-based recovery of old trimmed filenames. Report exports go only into the temporary browser profile. Instagram modules and browser-history records are fixtures; neither suite accesses your personal browser profile or account. Set `REEL_SAVER_BROWSER` to a compatible unpacked-extension-capable Chromium executable if needed.
+
+`test:queue` checks the queue UI with real content scripts and origin-private filesystem writes, including draft validation, mixed caps, pause/resume and profile isolation. The installed-extension suite also checks two real helper-tab handoffs with both destinations, real extension IndexedDB reports, and retained results after host reload. All automated browser suites use temporary profiles and fixtures.
+
+Queue drafts live in extension local storage; the worker stores the latest queue's reports and pending physical-save receipts in its own IndexedDB database. Content scripts do not put those reports in Instagram's page storage. These records contain profile/media IDs, shortcodes, basenames, sizes, statuses and timestamps, with no credentials, signed media URLs, absolute destination paths or folder handles. The helper tab uses the signed-in Instagram session and the same site permissions as ordinary profile downloads.
 
 Files:
 
@@ -223,10 +249,16 @@ reelnest/
       background.js
       bulk-background.js
       browser-receipts.js    Persistent browser download identity and report verification
+      profile-queue-background.js  Parent coordinator and source-tab lifecycle
+      profile-queue-owner.js       Shared operation ownership
+      profile-queue-store.js       Durable queue ledger and reports
+      profile-queue-recovery.js    Interrupted-output verification
     content/                Instagram page controls, queue, and local library
       profile-panel.js
       bulk-panel.js
       bulk-queue.js
+      profile-job-runner.js   Reusable per-profile download adapters
+      profile-queue-panel.js  Ordered profile controls and results
       folder-writer.js
       profile-cache.js
     instagram/              Self-contained functions injected into Instagram
@@ -239,6 +271,7 @@ reelnest/
     shared/
       core.js               Media validation, filenames, and download messages
       download-limits.js    Shared limit validation and allowance calculation
+      profile-queue-config.js  Queue input and draft validation
   scripts/                  Development checks and browser tools
   tests/                    Automated tests and fixtures
   plans/                    Local design notes (ignored by Git)

@@ -274,7 +274,7 @@
   }
   function stopped(signal) { if (signal?.aborted) throw failure('CACHE_IMPORT_CANCELLED', 'History import was canceled. Completed copies were kept.'); }
 
-  async function openLibrary(root, rawProfile) {
+  async function openLibrary(root, rawProfile, options = {}) {
     const profile = profileFor(rawProfile);
     if (!root || typeof root.getDirectoryHandle !== 'function' || typeof root.getFileHandle !== 'function') throw failure('CACHE_LIBRARY_REQUIRED', 'Choose a library folder first.');
     const releaseUse = await acquireUse();
@@ -455,6 +455,7 @@
           state = matches[0].found.data;
           recovered = matches[0].found.recovered;
         } else {
+          if (options.existingOnly === true) throw failure('CACHE_RECONCILIATION_REQUIRED', 'Choose the original library containing this profile’s verified history before recovering its interrupted save.');
           if (mapped && occupied.has(mapped.toLowerCase())) throw failure('CACHE_RECONCILIATION_REQUIRED', 'The indexed profile folder no longer has verified history. Restore its cache or import its report before downloading again.');
           for (let suffix = 0; suffix < 1000; suffix++) {
             const candidate = suffix === 0 ? expected : suffix === 1 ? `${expected}__${profile.id}` : `${expected}__${profile.id}_${suffix}`;

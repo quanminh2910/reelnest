@@ -16,7 +16,7 @@ assert.deepEqual(manifest.host_permissions, instagramMatches);
 assert.equal(manifest.externally_connectable, undefined);
 assert.equal(manifest.content_scripts.length, 1);
 assert.deepEqual(manifest.content_scripts[0].matches, instagramMatches);
-assert.deepEqual(manifest.content_scripts[0].js, ["src/shared/download-limits.js", ...["folder-writer.js", "profile-cache.js", "bulk-queue.js", "bulk-panel.js", "profile-panel.js"].map(name => `src/content/${name}`)]);
+assert.deepEqual(manifest.content_scripts[0].js, ["src/shared/download-limits.js", "src/shared/profile-queue-config.js", ...["folder-writer.js", "profile-cache.js", "bulk-queue.js", "bulk-panel.js", "profile-job-runner.js", "profile-queue-panel.js", "profile-panel.js"].map(name => `src/content/${name}`)]);
 assert.equal(manifest.content_scripts[0].all_frames, false);
 assert.ok(!manifest.content_scripts[0].world || manifest.content_scripts[0].world === "ISOLATED");
 const paths = new Set([

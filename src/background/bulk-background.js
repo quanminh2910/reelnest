@@ -2,6 +2,8 @@ import { profileSource } from "../instagram/profile-source.js";
 import { buildFilename, validateMedia, summarizeDownload, sanitizeFilenamePart, isInstagramMediaUrl } from "../shared/core.js";
 import "../shared/download-limits.js";
 import { getReceipt, verifyReceipt, recordReceipt, assertReceiptCapacity, isDownloadClaimedByOtherMedia, normalizeReport, previewReport } from "./browser-receipts.js";
+import { queueStore } from "./profile-queue-store.js";
+import { assertOrdinaryStart, queueBinding } from "./profile-queue-owner.js";
 
 const limits = globalThis.ReelSaverDownloadLimits;
 
@@ -21,6 +23,7 @@ const actions = new Set([
   "START", "PAGE", "RESOLVE", "DOWNLOAD", "STATUS", "CANCEL_ITEM", "ITEM_RESULT",
   "END", "REOPEN", "HEARTBEAT", "IDENTIFY", "SETTINGS_GET", "SETTINGS_SET", "CHECK_EXISTING",
   "BROWSER_IMPORT_PREVIEW", "BROWSER_IMPORT_COMMIT", "BROWSER_IMPORT_CANCEL",
+  "NATIVE_INTENT",
 ].map((action) => `REEL_SAVER_BULK_${action}`));
 
 export const isBulkMessage = (message) => actions.has(message?.type);
@@ -107,6 +110,49 @@ async function locked(action) {
   await before;
   try { return await action(); } finally { release(); }
 }
+export const withJobRegistration = action => locked(action);
+
+// Only the parent coordinator calls this entry point. Source tab routing is
+// derived from its registered binding, never accepted from a runtime message.
+export async function startQueueChild(ctx, value) {
+  return locked(async () => {
+    const old = await get(ACTIVE);
+    if (old?.active || old?.reservationMediaId) throw problem("JOB_BUSY", "Release the current profile before starting another one.");
+    const selected = options(value.options);
+    const profile = checkProfile(value.profile);
+    const job = { schema: 1, jobId: value.jobId, tabId: ctx.tabId, documentId: ctx.documentId,
+      profile, options: selected, queue: { ...value.queue }, active: true, state: "running", cursor: null,
+      exhausted: false, visited: [], createdAt: Date.now(), updatedAt: Date.now(),
+      committedNewSaves: 0, reservationMediaId: null };
+    const owner = await queueBinding(job, ctx);
+    if (owner.control !== "running") throw problem("QUEUE_PAUSED", "Resume the queue before starting another profile.");
+    await put({ [ACTIVE]: job,
+      ...Object.fromEntries((value.retryItems || []).map(item => [memberKey(job.jobId, item.mediaId), { ...checkItem(item), username: profile.username }])) });
+    try {
+      const latest = await queueBinding(job, ctx);
+      if (latest.control !== "running") throw problem("QUEUE_PAUSED", "The queue paused before this profile started.");
+    } catch (error) {
+      await put({ [ACTIVE]: { ...job, active: false, state: "stopped" } });
+      throw error;
+    }
+    if (old) {
+      const all = await chrome.storage.session.get(null);
+      const keys = Object.keys(all).filter(key => key.startsWith(prefix(old.jobId)));
+      if (keys.length) await chrome.storage.session.remove(keys);
+    }
+    return { jobId: job.jobId, profile, options: selected, queue: job.queue,
+      ...(value.retryItems ? { retryItems: value.retryItems } : {}) };
+  });
+}
+
+export async function rebindQueueChild(ctx, jobId, binding) {
+  return mutate(async () => {
+    const job = await currentJob(ctx, jobId, { inactive: true, profile: false });
+    const next = { ...job, queue: { ...binding } };
+    await queueBinding(next, ctx);
+    await put({ [ACTIVE]: next });
+  });
+}
 
 // The registration lock can wait for a transfer during Stop. Keep short journal
 // transactions separate so that transfer can settle without waiting on Stop.
@@ -144,10 +190,16 @@ async function reserveOperation(ctx, jobId, item, attemptId) {
       throw problem("RECONCILIATION_REQUIRED", "The previous video's save must be confirmed before another video can start.", "limit");
     }
     assertAllowance(job);
+    if (job.queue) await queueStore.reserve(job.queue.runId, job.queue.entryId, item, attemptId);
     const operation = { jobId, mediaId: item.mediaId, shortcode: item.shortcode, attemptId,
       state: "resolving", quotaState: "reserved", startedAt: Date.now(), destination: job.options.destination };
-    await put({ [operationKey(jobId, item.mediaId)]: operation,
-      [ACTIVE]: { ...job, committedNewSaves: quota.committed, reservationMediaId: item.mediaId, updatedAt: Date.now() } });
+    try {
+      await put({ [operationKey(jobId, item.mediaId)]: operation,
+        [ACTIVE]: { ...job, committedNewSaves: quota.committed, reservationMediaId: item.mediaId, updatedAt: Date.now() } });
+    } catch (error) {
+      if (job.queue) await queueStore.settle(job.queue.runId, job.queue.entryId, item, attemptId, { state: "failed", error: { code: "STORAGE_FAILED", message: "The save never started because its reservation could not be recorded." } });
+      throw error;
+    }
     return operation;
   });
 }
@@ -186,6 +238,21 @@ async function writeOperation(ctx, jobId, mediaId, attemptId, patch, outcome) {
       next.quotaState = "reserved";
       if (reserved && reserved !== mediaId) throw problem("RECONCILIATION_REQUIRED", "Another video still has an unresolved save.", "limit");
       reserved = mediaId;
+    }
+    if (job.queue && Number.isInteger(next.downloadId) && previous.downloadId !== next.downloadId) {
+      // Chrome's acceptance must survive a failure of the separate durable
+      // queue archive, just as it survives a browser-receipt storage failure.
+      await put({ [key]: { ...previous, downloadId: next.downloadId, filename: next.filename, state: "in_progress" } });
+    }
+    if (job.queue && (["saved", "released", "unknown"].includes(outcome) || next.quotaState === "reserved" && next.filename)) {
+      const item = await get(memberKey(jobId, mediaId));
+      await queueStore.settle(job.queue.runId, job.queue.entryId, item, attemptId, {
+        state: outcome === "saved" ? "saved" : outcome === "released" ? next.state : "unknown",
+        ...(next.filename ? { filename: next.filename.split(/[\\/]/).pop() } : {}),
+        ...(next.bytesWritten != null ? { bytesWritten: next.bytesWritten } : {}),
+        ...(Number.isInteger(next.downloadId) ? { downloadId: next.downloadId } : {}),
+        ...(next.error ? { error: next.error } : {}),
+      });
     }
     await put({ [key]: next, [ACTIVE]: { ...job, committedNewSaves: committed,
       reservationMediaId: reserved, updatedAt: Date.now() } });
@@ -240,19 +307,30 @@ async function currentJob(ctx, jobId, { inactive = false, profile = true, import
   }
   if (!inactive && !job.active) throw problem("STALE_JOB", "This batch has ended. Start a new batch or retry its failed items.");
   if (job.kind === "browser_import" && !importing) throw problem("JOB_BUSY", "Finish or cancel the browser history import before downloading.");
-  if (profile) await tabAtProfile(ctx.tabId, job.profile.username);
+  if (job.queue) {
+    await queueBinding(job, ctx, { settling: !profile });
+    if (profile) await tabAtProfile(job.queue.sourceTabId, job.profile.username);
+  } else if (profile) await tabAtProfile(ctx.tabId, job.profile.username);
   return job;
 }
 
 async function source(ctx, request) {
   let result;
+  const job = await get(ACTIVE);
+  const queued = job?.active && job.queue && request.action !== "identify" && job.tabId === ctx.tabId && job.documentId === ctx.documentId ? job : null;
+  if (queued) await queueBinding(queued, ctx);
+  const target = queued ? { tabId: queued.queue.sourceTabId, documentIds: [queued.queue.sourceDocumentId] } : { tabId: ctx.tabId };
   try {
     const frames = await chrome.scripting.executeScript({
-      target: { tabId: ctx.tabId }, world: "MAIN", func: profileSource, args: [request],
+      target, world: "MAIN", func: profileSource, args: [request],
     });
     result = frames.find((frame) => frame.frameId === 0)?.result;
   } catch {
     throw problem("PAGE_UNAVAILABLE", "Instagram could not be read. Reload the profile and start a new batch.", request.action, false);
+  }
+  if (queued) {
+    await queueBinding(queued, ctx);
+    await tabAtProfile(queued.queue.sourceTabId, queued.profile.username);
   }
   if (!result?.ok) {
     const e = result?.error || {};
@@ -306,6 +384,7 @@ async function restoreTab(job) {
 
 async function start(ctx, message, kind) {
   return locked(async () => {
+    await assertOrdinaryStart();
     const selected = options(message.options);
     const old = await get(ACTIVE);
     if (old?.reservationMediaId) {
@@ -373,6 +452,7 @@ async function page(ctx, message) {
     throw problem("PAGINATION_STALLED", "Instagram repeated a page cursor. The scan is incomplete.", "discovery");
   }
   const items = output.items.map((entry) => ({ ...checkItem(entry), username: job.profile.username }));
+  if (job.queue) await queueStore.discover(job.queue.runId, job.queue.entryId, items);
   const nextPage = { items, nextCursor: output.hasMore ? output.nextCursor : null, hasMore: output.hasMore };
   await locked(() => mutate(async () => {
     const current = await currentJob(ctx, job.jobId);
@@ -628,6 +708,16 @@ async function nativeResult(ctx, message) {
   return { ok: true };
 }
 
+async function nativeIntent(ctx, message) {
+  const { job, item, attemptId } = await member(ctx, message);
+  if (!job.queue || job.options.destination !== "folder" || typeof message.filename !== "string" ||
+      message.filename.length > 200 || !/\.mp4$/i.test(message.filename) || /[\\/\u0000-\u001f<>:"|?*]/.test(message.filename)) throw problem("INVALID_RESULT", "The reserved video filename is invalid.");
+  const operation = await get(operationKey(job.jobId, item.mediaId));
+  if (operation?.state !== "prepared" || operation.attemptId !== attemptId) throw problem("STALE_OPERATION", "This file intent belongs to an older save.");
+  await writeOperation(ctx, job.jobId, item.mediaId, attemptId, { filename: message.filename, state: "prepared" }, "unknown");
+  return { ok: true };
+}
+
 async function end(ctx, message) {
   return locked(async () => {
     const job = await currentJob(ctx, message.jobId, { inactive: true, profile: false });
@@ -817,6 +907,7 @@ export async function handleBulkMessage(message, sender) {
     if (action === "STATUS") return await operationStatus(ctx, message);
     if (action === "CANCEL_ITEM") return await cancelItem(ctx, message);
     if (action === "ITEM_RESULT") return await nativeResult(ctx, message);
+    if (action === "NATIVE_INTENT") return await nativeIntent(ctx, message);
     if (action === "END") return await end(ctx, message);
     if (action === "REOPEN") return await locked(() => mutate(async () => {
       const job = await currentJob(ctx, message.jobId, { inactive: true });
@@ -844,7 +935,14 @@ export async function cleanupBulkTab(tabId) {
   await locked(() => mutate(async () => {
     const current = await get(ACTIVE);
     if (current?.jobId !== observed.jobId || current.documentId !== observed.documentId) return;
-    await put({ [ACTIVE]: { ...current, active: !!allowance(current).reserved, state: "interrupted", updatedAt: Date.now() } });
+    await put({ [ACTIVE]: { ...current, active: current.queue ? false : !!allowance(current).reserved, state: "interrupted", updatedAt: Date.now() } });
     await restoreTab(current);
   }));
+}
+
+export async function interruptQueueChild(jobId) {
+  return mutate(async () => {
+    const current = await get(ACTIVE);
+    if (current?.jobId === jobId && current.queue) await put({ [ACTIVE]: { ...current, active: false, state: "interrupted", updatedAt: Date.now() } });
+  });
 }
